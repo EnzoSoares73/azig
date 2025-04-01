@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const vcpkg_root = try setupVcpkg(b);
-    const libuv_path = try installLibuv(b, vcpkg_root);
+    installLibuv(b, vcpkg_root);
 
     const exe = b.addExecutable(.{
         .name = "azig",
@@ -29,8 +29,8 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("uv");
     exe.linkLibC();
 
-    exe.addLibraryPath(b.path(b.pathJoin(&.{ libuv_path, "vcpkg/installed/x64-windows/lib" })));
-    exe.addIncludePath(b.path(b.pathJoin(&.{ libuv_path, "vcpkg/installed/x64-windows/include" })));
+    exe.addLibraryPath(b.path("vcpkg/installed/x64-windows/lib"));
+    exe.addIncludePath(b.path("vcpkg/installed/x64-windows/include"));
 
     if (target.result.os.tag == .windows) {
         exe.linkSystemLibrary("ws2_32");
@@ -82,23 +82,38 @@ pub fn build(b: *std.Build) void {
 }
 
 fn setupVcpkg(b: *std.Build) ![]const u8 {
-    const vcpkg_dir = "vcpkg"; // Local vcpkg installation
-    const vcpkg_root = b.pathJoin(&.{ b.install_prefix, vcpkg_dir });
+    const vcpkg_dir = "vcpkg";
+    var clone_step: *std.Build.Step = undefined;
 
-    // Only install if vcpkg doesn't exist
-    if (!dirExists(vcpkg_root)) {
-        _ = b.addSystemCommand(&.{ "git", "clone", "https://github.com/microsoft/vcpkg.git", vcpkg_dir });
-
-        _ = b.addSystemCommand(&.{
-            if (builtin.os.tag == .windows) "bootstrap-vcpkg.bat" else "./bootstrap-vcpkg.sh"
-        });
+    if (!try fileExists(vcpkg_dir)) {
+        const clone_cmd = b.addSystemCommand(&.{ "git", "clone", "https://github.com/microsoft/vcpkg.git" });
+        clone_step = b.step("Clone vcpkg", "Clone vcpkg");
+        clone_step.dependOn(&clone_cmd.step);
+    } else if (try fileExists(b.pathJoin(&.{ vcpkg_dir, ".git" }))) {
+        const clone_cmd = b.addSystemCommand(&.{ "git", "pull" });
+        clone_step = b.step("Pull vcpkg", "Pull vcpkg");
+        clone_step.dependOn(&clone_cmd.step);
+    } else {
+        try std.fs.cwd().deleteFile(vcpkg_dir);
+        const clone_cmd = b.addSystemCommand(&.{ "git", "clone", "https://github.com/microsoft/vcpkg.git" });
+        clone_step = b.step("Clone vcpkg", "Clone vcpkg");
+        clone_step.dependOn(&clone_cmd.step);
     }
 
-    return vcpkg_root;
+    if (!try fileExists(b.pathJoin(&.{ vcpkg_dir, "vcpkg.exe" }))) {
+        const bootstrap_cmd = b.addSystemCommand(&.{if (builtin.os.tag == .windows) "bootstrap-vcpkg.bat" else "./bootstrap-vcpkg.sh"});
+        bootstrap_cmd.setCwd(b.path(vcpkg_dir));
+        bootstrap_cmd.step.dependOn(clone_step);
+        var bootstrap_step = b.step("Bootstrap vcpkg", "Bootstrap vcpkg");
+        bootstrap_step.dependOn(&bootstrap_cmd.step);
+
+        b.getInstallStep().dependOn(bootstrap_step);
+    }
+
+    return vcpkg_dir;
 }
 
-// Helper: Install libuv via vcpkg
-fn installLibuv(b: *std.Build, vcpkg_root: []const u8) ![]const u8 {
+fn installLibuv(b: *std.Build, vcpkg_root: []const u8) void {
     const triplet = switch (builtin.os.tag) {
         .windows => "x64-windows",
         .linux => "x64-linux",
@@ -106,20 +121,25 @@ fn installLibuv(b: *std.Build, vcpkg_root: []const u8) ![]const u8 {
         else => @panic("Unsupported OS"),
     };
 
-    _ = b.addSystemCommand(&.{
-        b.pathJoin(&.{ vcpkg_root, "vcpkg" }),
+    const install_libuv_cmd = b.addSystemCommand(&.{
+        "vcpkg",
         "install",
         "libuv",
         "--triplet",
         triplet,
     });
+    install_libuv_cmd.setCwd(b.path(vcpkg_root));
+    var install_libuv_step = b.step("Install libuv", "Install libuv");
+    install_libuv_step.dependOn(&install_libuv_cmd.step);
 
-    return b.pathJoin(&.{ vcpkg_root, "installed", triplet });
+    b.getInstallStep().dependOn(install_libuv_step);
 }
 
-// Helper: Check if directory exists
-fn dirExists(path: []const u8) bool {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = false }) catch return false;
-    dir.close();
-    return true;
+fn fileExists(path: []const u8) !bool {
+    var found = true;
+    std.fs.cwd().access(path, .{}) catch |e| switch (e) {
+        error.FileNotFound => found = false,
+        else => return e,
+    };
+    return found;
 }
