@@ -1,13 +1,11 @@
 const std = @import("std");
 const parse_data = @import("parse_data.zig").parse_data;
 const serve = @import("server.zig").serve;
+const libuv_execute = @import("libuv.zig").libuv_execute;
 const print = std.debug.print;
 const mem = std.mem;
 const net = std.net;
 const StringHashMap = std.StringHashMap;
-const uv = @cImport({
-    @cInclude("uv.h");
-});
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -56,21 +54,6 @@ fn run_threaded(allocator: mem.Allocator) !void {
     }
 }
 
-fn run_eloop(_: mem.Allocator) !void {
-    const loop = uv.uv_default_loop();
-    print("LibUV loop: {*}\n", .{loop});
-
-    var timer: uv.uv_timer_t = undefined;
-    if (uv.uv_timer_init(loop, &timer) != 0) {
-        print("Timer init failed!\n", .{});
-        return;
-    }
-
-    _ = uv.uv_timer_start(&timer, struct {
-        fn callback(_: [*c]uv.uv_timer_t) callconv(.C) void {
-            print("Timer fired!\n", .{});
-        }
-    }.callback, 1000, 0);
-
-    _ = uv.uv_run(loop, uv.UV_RUN_DEFAULT);
+fn run_eloop(allocator: mem.Allocator) !void {
+    libuv_execute(allocator);
 }

@@ -94,7 +94,7 @@ fn setupVcpkg(b: *std.Build) ![]const u8 {
         clone_step = b.step("Pull vcpkg", "Pull vcpkg");
         clone_step.dependOn(&clone_cmd.step);
     } else {
-        try std.fs.cwd().deleteFile(vcpkg_dir);
+        try std.fs.cwd().deleteDirZ(vcpkg_dir);
         const clone_cmd = b.addSystemCommand(&.{ "git", "clone", "https://github.com/microsoft/vcpkg.git" });
         clone_step = b.step("Clone vcpkg", "Clone vcpkg");
         clone_step.dependOn(&clone_cmd.step);
