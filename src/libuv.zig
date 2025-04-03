@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const print = std.debug.print;
+const request_lib = @import("request.zig");
 const uv = @cImport({
     @cInclude("uv.h");
 });
@@ -39,10 +40,20 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
     }
 
     if (nread > 0) {
-        const request = buf.*.base[0..@intCast(nread)];
-        print("Received request:\n{s}\n", .{request});
+        const request_raw = buf.*.base[0..@intCast(nread)];
 
-        const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello, libuv!";
+        var request: request_lib.Request = request_lib.parseRequest(allocator, request_raw) catch {
+            print("Failed to parse request\n", .{});
+            return;
+        };
+        request.printSelf();
+        request.deinit();
+
+        const response =
+            "HTTP/1.1 200 OK \r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n";
+
         const write_req = allocator.create(uv.uv_write_t) catch {
             print("Failed to allocate write_req\n", .{});
             return;
@@ -90,6 +101,8 @@ fn alloc_buffer(handle: [*c]uv.uv_handle_t, suggested_size: usize, buf: [*c]uv.u
 }
 
 pub fn libuv_execute() void {
+    print("Started server\n", .{});
+
     const loop = uv.uv_default_loop();
 
     var server: uv.uv_tcp_t = undefined;
@@ -101,7 +114,7 @@ pub fn libuv_execute() void {
 
     _ = uv.uv_listen(@ptrCast(&server), 128, on_connection);
 
-    print("Server running at http://0.0.0.0:2500\n", .{});
+    print("Listening on http://0.0.0.0:2500\n", .{});
 
     _ = uv.uv_run(loop, uv.UV_RUN_DEFAULT);
 }

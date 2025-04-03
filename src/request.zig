@@ -41,6 +41,8 @@ pub const Request = struct {
         if (self.body) |body| {
             print("\n{s}\n", .{body});
         }
+
+        print("\n\n", .{});
     }
 };
 
