@@ -55,5 +55,5 @@ fn run_threaded(allocator: mem.Allocator) !void {
 }
 
 fn run_eloop() !void {
-    libuv_execute();
+    try libuv_execute();
 }

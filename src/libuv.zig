@@ -4,23 +4,46 @@ const print = std.debug.print;
 const request_lib = @import("request.zig");
 const uv = @import("imports/libuv.zig");
 
+const write_baton = struct {
+    req: uv.uv_work_t,
+    stream: [*c]uv.uv_stream_t,
+    allocator: mem.Allocator,
+    request_raw: []u8,
+};
+
 fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
-    const arena = std.heap.page_allocator.create(std.heap.ArenaAllocator) catch return;
-    arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const gpa_ptr: *std.heap.GeneralPurposeAllocator(.{}) = @ptrCast(@alignCast(server.*.data));
+    const gpa_allocator = gpa_ptr.*.allocator();
+
+    const arena = gpa_allocator.create(std.heap.ArenaAllocator) catch {
+        print("Failed to create arena allocator\n", .{});
+        return;
+    };
+    arena.* = std.heap.ArenaAllocator.init(gpa_allocator);
     const allocator = arena.allocator();
 
     if (status < 0) {
         print("New connection error {s}\n", .{uv.uv_strerror(status)});
+        arena.deinit();
+        gpa_allocator.destroy(arena);
         return;
     }
 
-    const client: [*c]uv.uv_tcp_t = allocator.create(uv.uv_tcp_t) catch return;
+    const client: [*c]uv.uv_tcp_t = allocator.create(uv.uv_tcp_t) catch {
+        print("Failed to allocate client\n", .{});
+        arena.deinit();
+        gpa_allocator.destroy(arena);
+        return;
+    };
 
     _ = uv.uv_tcp_init(server.*.loop, client);
     client.*.data = @constCast(arena);
 
     if (uv.uv_accept(server, @ptrCast(client)) == 0) {
         _ = uv.uv_read_start(@ptrCast(client), alloc_buffer, on_read);
+    } else {
+        arena.deinit();
+        gpa_allocator.destroy(arena);
     }
 }
 
@@ -39,33 +62,53 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
 
     if (nread > 0) {
         const request_raw = buf.*.base[0..@intCast(nread)];
-
-        var request: request_lib.Request = request_lib.parseRequest(allocator, request_raw) catch {
-            print("Failed to parse request\n", .{});
+        const baton = allocator.create(write_baton) catch {
+            print("Failed to allocate baton\n", .{});
             return;
         };
-        request.printSelf();
-        request.deinit();
+        baton.*.req.data = @ptrCast(@alignCast(baton));
+        baton.*.allocator = allocator;
+        baton.*.request_raw = request_raw;
+        baton.*.stream = stream;
 
-        const response =
-            "HTTP/1.1 200 OK \r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n";
-
-        const write_req = allocator.create(uv.uv_write_t) catch {
-            print("Failed to allocate write_req\n", .{});
-            return;
-        };
-
-        var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response)), @intCast(response.len));
-        _ = uv.uv_write(
-            write_req,
-            stream,
-            &buf_resp,
-            1,
-            on_write_complete,
-        );
+        _ = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), parse_request, write);
     }
+}
+
+fn parse_request(_: [*c]uv.uv_work_t) callconv(.c) void {
+    const baton: *write_baton = @ptrCast(@alignCast(req.*.data));
+    var request: request_lib.Request = request_lib.parseRequest(baton.*.allocator, baton.*.request_raw) catch {
+        print("Failed to parse request\n", .{});
+        return;
+    };
+    request.printSelf();
+    request.deinit();
+}
+
+fn write(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
+    if (status < 0) {
+        print("Operation cancelled\n", .{});
+        return;
+    }
+    const baton: *write_baton = @ptrCast(@alignCast(req.*.data));
+    const response =
+        "HTTP/1.1 200 OK \r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n";
+
+    const write_req = baton.*.allocator.create(uv.uv_write_t) catch {
+        print("Failed to allocate write_req\n", .{});
+        return;
+    };
+
+    var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response)), @intCast(response.len));
+    _ = uv.uv_write(
+        write_req,
+        baton.*.stream,
+        &buf_resp,
+        1,
+        on_write_complete,
+    );
 }
 
 fn on_write_complete(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
@@ -98,13 +141,18 @@ fn alloc_buffer(handle: [*c]uv.uv_handle_t, suggested_size: usize, buf: [*c]uv.u
     );
 }
 
-pub fn libuv_execute() void {
+pub fn libuv_execute() !void {
+    const gpa: *std.heap.GeneralPurposeAllocator(.{}) = try std.heap.page_allocator.create(std.heap.GeneralPurposeAllocator(.{}));
+    gpa.* = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
     print("Started server\n", .{});
 
     const loop = uv.uv_default_loop();
 
     var server: uv.uv_tcp_t = undefined;
     _ = uv.uv_tcp_init(loop, &server);
+    server.data = @constCast(gpa);
 
     var addr: uv.struct_sockaddr_in = undefined;
     _ = uv.uv_ip4_addr("0.0.0.0", 2500, &addr);
