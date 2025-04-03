@@ -2,9 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const print = std.debug.print;
 const request_lib = @import("request.zig");
-const uv = @cImport({
-    @cInclude("uv.h");
-});
+const uv = @import("imports/libuv.zig");
 
 fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
     const arena = std.heap.page_allocator.create(std.heap.ArenaAllocator) catch return;
