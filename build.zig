@@ -16,8 +16,8 @@ pub fn build(b: *std.Build) !void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const vcpkg_root = try setupVcpkg(b);
-    installLibuv(b, vcpkg_root);
+    // const vcpkg_root = try setupVcpkg(b);
+    // installLibuv(b, vcpkg_root);
 
     const exe = b.addExecutable(.{
         .name = "azig",

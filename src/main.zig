@@ -8,13 +8,13 @@ const net = std.net;
 const StringHashMap = std.StringHashMap;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // const allocator = gpa.allocator();
+    // defer _ = gpa.deinit();
 
     //try run_naive(allocator);
     //try run_threaded(allocator);
-    try run_eloop(allocator);
+    try run_eloop();
 }
 
 fn run_naive(allocator: mem.Allocator) !void {
@@ -54,6 +54,6 @@ fn run_threaded(allocator: mem.Allocator) !void {
     }
 }
 
-fn run_eloop(allocator: mem.Allocator) !void {
-    libuv_execute(allocator);
+fn run_eloop() !void {
+    libuv_execute();
 }

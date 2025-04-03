@@ -2,12 +2,12 @@ import http from 'k6/http';
 import { sleep, check } from 'k6';
 
 export const options = {
-  vus: 1000,
+  vus: 10000,
   duration: '30s',
 };
 
 export default function() {
-  let res = http.get('https://quickpizza.grafana.com');
+  let res = http.get('http://0.0.0.0:2500');
   check(res, { "status is 200": (res) => res.status === 200 });
-  sleep(0.1);
+  sleep(1);
 }
