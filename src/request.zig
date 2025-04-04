@@ -56,17 +56,42 @@ pub fn parseRequest(allocator: mem.Allocator, request_raw: []u8) !Request {
 }
 
 fn parseHeaders(allocator: mem.Allocator, raw_headers: []const u8) !Request {
-    var request: Request = Request.init(allocator);
+    var request = Request.init(allocator);
 
-    var header_iter = mem.tokenizeSequence(u8, raw_headers, "\r\n");
+    const first_line_end = mem.indexOfScalar(u8, raw_headers, '\n') orelse raw_headers.len;
+    const first_line = mem.trim(u8, raw_headers[0..first_line_end], "\r");
 
-    if (header_iter.next()) |first_line| {
-        request.method, request.path, request.version = parseFirstLine(first_line);
+    {
+        var iter = mem.splitScalar(u8, first_line, ' ');
+        request.method = iter.next() orelse "";
+        request.path = iter.next() orelse "";
+        request.version = iter.next() orelse "";
     }
 
-    while (header_iter.next()) |line| {
-        const name, const value = parseHeader(line);
-        try request.headers.put(name, value);
+    var headers = raw_headers[first_line_end + 1 ..];
+    while (headers.len > 0) {
+        const line_end = mem.indexOfScalar(u8, headers, '\n') orelse headers.len;
+        const line = mem.trim(u8, headers[0..line_end], "\r");
+
+        if (line.len > 0) {
+            const colon = mem.indexOfScalar(u8, line, ':') orelse {
+                headers = headers[line_end + 1 ..];
+                continue;
+            };
+
+            const name = mem.trim(u8, line[0..colon], " ");
+            const value = if (colon + 1 < line.len)
+                mem.trim(u8, line[colon + 1 ..], " ")
+            else
+                "";
+
+            try request.headers.put(name, value);
+        }
+
+        if (line_end + 1 > headers.len) {
+            break;
+        }
+        headers = headers[line_end + 1 ..];
     }
 
     return request;

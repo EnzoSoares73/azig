@@ -62,53 +62,30 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
 
     if (nread > 0) {
         const request_raw = buf.*.base[0..@intCast(nread)];
-        const baton = allocator.create(write_baton) catch {
-            print("Failed to allocate baton\n", .{});
+        var request: request_lib.Request = request_lib.parseRequest(allocator, request_raw) catch {
+            print("Failed to parse request\n", .{});
             return;
         };
-        baton.*.req.data = @ptrCast(@alignCast(baton));
-        baton.*.allocator = allocator;
-        baton.*.request_raw = request_raw;
-        baton.*.stream = stream;
+        request.deinit();
+        const response =
+            "HTTP/1.1 200 OK \r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n";
 
-        _ = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), parse_request, write);
+        const write_req = allocator.create(uv.uv_write_t) catch {
+            print("Failed to allocate write_req\n", .{});
+            return;
+        };
+
+        var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response)), @intCast(response.len));
+        _ = uv.uv_write(
+            write_req,
+            stream,
+            &buf_resp,
+            1,
+            on_write_complete,
+        );
     }
-}
-
-fn parse_request(_: [*c]uv.uv_work_t) callconv(.c) void {
-    const baton: *write_baton = @ptrCast(@alignCast(req.*.data));
-    var request: request_lib.Request = request_lib.parseRequest(baton.*.allocator, baton.*.request_raw) catch {
-        print("Failed to parse request\n", .{});
-        return;
-    };
-    request.printSelf();
-    request.deinit();
-}
-
-fn write(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
-    if (status < 0) {
-        print("Operation cancelled\n", .{});
-        return;
-    }
-    const baton: *write_baton = @ptrCast(@alignCast(req.*.data));
-    const response =
-        "HTTP/1.1 200 OK \r\n" ++
-        "Connection: close\r\n" ++
-        "\r\n";
-
-    const write_req = baton.*.allocator.create(uv.uv_write_t) catch {
-        print("Failed to allocate write_req\n", .{});
-        return;
-    };
-
-    var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response)), @intCast(response.len));
-    _ = uv.uv_write(
-        write_req,
-        baton.*.stream,
-        &buf_resp,
-        1,
-        on_write_complete,
-    );
 }
 
 fn on_write_complete(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
