@@ -96,22 +96,3 @@ fn parseHeaders(allocator: mem.Allocator, raw_headers: []const u8) !Request {
 
     return request;
 }
-
-fn parseFirstLine(first_line: []const u8) [3][]const u8 {
-    var first_line_iter = mem.tokenizeScalar(u8, first_line, ' ');
-
-    const method = first_line_iter.next() orelse "";
-    const path = first_line_iter.next() orelse "";
-    const version = first_line_iter.next() orelse "";
-
-    return .{ method, path, version };
-}
-
-fn parseHeader(line: []const u8) [2][]const u8 {
-    var line_iter = mem.tokenizeSequence(u8, line, ": ");
-
-    const name = line_iter.next() orelse "";
-    const value = line_iter.next() orelse "";
-
-    return .{ name, value };
-}

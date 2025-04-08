@@ -1,10 +1,19 @@
 const std = @import("std");
 const libuv_execute = @import("libuv.zig").libuv_execute;
-const print = std.debug.print;
+const Server = @import("server.zig").Server;
 const mem = std.mem;
-const net = std.net;
-const StringHashMap = std.StringHashMap;
+const Request = @import("request.zig").Request;
+const Response = @import("response.zig").Response;
+const Config = @import("config.zig").Config;
 
 pub fn main() !void {
-    try libuv_execute();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const server = Server.init(&allocator, Config{}, on_response);
+    try server.start();
+}
+
+fn on_response(_: mem.Allocator, _: *Request, _: *Response) !void {
 }
