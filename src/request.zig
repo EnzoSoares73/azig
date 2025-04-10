@@ -44,55 +44,49 @@ pub const Request = struct {
 
         print("\n\n", .{});
     }
+
+    pub fn parseRequest(self: *Self, request_raw: []u8) !void {
+        var request_iter = mem.tokenizeSequence(u8, request_raw, "\r\n\r\n");
+        const raw_headers = request_iter.next() orelse "";
+        try parseHeaders(self, raw_headers);
+        self.*.body = request_iter.next() orelse null;
+    }
+
+    fn parseHeaders(self: *Self, raw_headers: []const u8) !void {
+        const first_line_end = mem.indexOfScalar(u8, raw_headers, '\n') orelse raw_headers.len;
+        const first_line = mem.trim(u8, raw_headers[0..first_line_end], "\r");
+
+        {
+            var iter = mem.splitScalar(u8, first_line, ' ');
+            self.*.method = iter.next() orelse "";
+            self.*.path = iter.next() orelse "";
+            self.*.version = iter.next() orelse "";
+        }
+
+        var headers = raw_headers[first_line_end + 1 ..];
+        while (headers.len > 0) {
+            const line_end = mem.indexOfScalar(u8, headers, '\n') orelse headers.len;
+            const line = mem.trim(u8, headers[0..line_end], "\r");
+
+            if (line.len > 0) {
+                const colon = mem.indexOfScalar(u8, line, ':') orelse {
+                    headers = headers[line_end + 1 ..];
+                    continue;
+                };
+
+                const name = mem.trim(u8, line[0..colon], " ");
+                const value = if (colon + 1 < line.len)
+                    mem.trim(u8, line[colon + 1 ..], " ")
+                else
+                    "";
+
+                try self.*.headers.put(name, value);
+            }
+
+            if (line_end + 1 > headers.len) {
+                break;
+            }
+            headers = headers[line_end + 1 ..];
+        }
+    }
 };
-
-pub fn parseRequest(allocator: mem.Allocator, request_raw: []u8) !Request {
-    var request_iter = mem.tokenizeSequence(u8, request_raw, "\r\n\r\n");
-    const raw_headers = request_iter.next() orelse "";
-    var request = try parseHeaders(allocator, raw_headers);
-    request.body = request_iter.next() orelse null;
-
-    return request;
-}
-
-fn parseHeaders(allocator: mem.Allocator, raw_headers: []const u8) !Request {
-    var request = Request.init(allocator);
-
-    const first_line_end = mem.indexOfScalar(u8, raw_headers, '\n') orelse raw_headers.len;
-    const first_line = mem.trim(u8, raw_headers[0..first_line_end], "\r");
-
-    {
-        var iter = mem.splitScalar(u8, first_line, ' ');
-        request.method = iter.next() orelse "";
-        request.path = iter.next() orelse "";
-        request.version = iter.next() orelse "";
-    }
-
-    var headers = raw_headers[first_line_end + 1 ..];
-    while (headers.len > 0) {
-        const line_end = mem.indexOfScalar(u8, headers, '\n') orelse headers.len;
-        const line = mem.trim(u8, headers[0..line_end], "\r");
-
-        if (line.len > 0) {
-            const colon = mem.indexOfScalar(u8, line, ':') orelse {
-                headers = headers[line_end + 1 ..];
-                continue;
-            };
-
-            const name = mem.trim(u8, line[0..colon], " ");
-            const value = if (colon + 1 < line.len)
-                mem.trim(u8, line[colon + 1 ..], " ")
-            else
-                "";
-
-            try request.headers.put(name, value);
-        }
-
-        if (line_end + 1 > headers.len) {
-            break;
-        }
-        headers = headers[line_end + 1 ..];
-    }
-
-    return request;
-}
