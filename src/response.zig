@@ -23,26 +23,34 @@ pub const Response = struct {
         self.headers.deinit();
         self.* = undefined;
     }
+    
+    pub fn addHeader(self: *Self, name: []u8, value: []u8) !void {
+        try self.*.headers.put(name, value);
+    }
 
-    pub fn to_string(self: Self, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn to_string(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var response_string = std.ArrayList(u8).init(allocator);
         defer response_string.deinit();
 
         const writer = response_string.writer();
 
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
-            self.status_code,
+            self.*.status_code,
             statusCodeToString(self.status_code) orelse "Unknown",
         });
 
-        var headers_iter = self.headers.iterator();
+        const content_length = "Content-Length";
+        const len = if (self.*.body) |body| body.len else 0;
+        try self.*.addHeader(@constCast(content_length), try std.fmt.allocPrint(allocator, "{d}", .{len}));
+
+        var headers_iter = self.*.headers.iterator();
         while (headers_iter.next()) |entry| {
             try writer.print("{s}: {s}\r\n", .{entry.key_ptr.*, entry.value_ptr.*});
         }
 
         try writer.writeAll("\r\n");
 
-        if (self.body) |body| {
+        if (self.*.body) |body| {
             try writer.writeAll(body);
         }
 

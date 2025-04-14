@@ -72,8 +72,7 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             print("Failed to allocate request\n", .{});
             return;
         };
-        request.* = Request.init(allocator);
-        request.*.parseRequest(request_raw) catch {
+        request.* = Request.init(allocator, request_raw) catch {
             print("Failed to parse request\n", .{});
             return;
         };
@@ -106,18 +105,38 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             return;
         };
 
+        const connection_header = request.*.getHeader(@constCast("Connection"));
+        var is_keep_alive: bool = true;
+
+        if (connection_header) |header| {
+            if (!std.ascii.eqlIgnoreCase(header, "keep-alive")) {
+                is_keep_alive = false;
+            }
+        }
+
         var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text)), @intCast(response_text.len));
         _ = uv.uv_write(
             write_req,
             stream,
             &buf_resp,
             1,
-            on_write_complete,
+            if (is_keep_alive) on_write_complete_keep_alive else on_write_complete_no_keep_alive,
         );
     }
 }
 
-fn on_write_complete(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
+fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
+    const ctx: *Context = @ptrCast(@alignCast(req.*.handle.*.data));
+    var write_req_pool = ctx.*.write_req_allocator;
+    defer write_req_pool.destroy(req);
+
+    if (status < 0) {
+        print("Write error: {s}\n", .{uv.uv_strerror(status)});
+    }
+    _ = uv.uv_read_start(req.*.handle, alloc_buffer, on_read);
+}
+
+fn on_write_complete_no_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
     const ctx: *Context = @ptrCast(@alignCast(req.*.handle.*.data));
     var write_req_pool = ctx.*.write_req_allocator;
     defer write_req_pool.destroy(req);
@@ -195,6 +214,7 @@ pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callba
     var server: uv.uv_tcp_t = undefined;
     _ = uv.uv_tcp_init(loop, &server);
     server.data = @constCast(ctx);
+    _ = uv.uv_tcp_nodelay(&server, @intCast(0));
 
     var addr: uv.struct_sockaddr_in = undefined;
     _ = uv.uv_ip4_addr("0.0.0.0", @intCast(config.port), &addr);
