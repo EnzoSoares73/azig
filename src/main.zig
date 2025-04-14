@@ -7,7 +7,7 @@ const Response = @import("response.zig").Response;
 const Config = @import("config.zig").Config;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     var allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
@@ -15,5 +15,4 @@ pub fn main() !void {
     try server.start();
 }
 
-fn on_response(_: mem.Allocator, _: *Request, _: *Response) !void {
-}
+fn on_response(_: mem.Allocator, _: *Request, _: *Response) !void {}

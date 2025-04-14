@@ -6,87 +6,69 @@ const uv = @import("imports/libuv.zig");
 const Config = @import("config.zig").Config;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
-const callback_t = @import("constants.zig").callback_t;
-const buffer_pool_t = @import("constants.zig").buffer_pool_t;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
 const actual_buffer_size = @import("constants.zig").actual_buffer_size;
-
-const Context = struct {
-    callback: callback_t,
-    arena: *std.heap.ArenaAllocator,
-    buffer_allocator: buffer_pool_t,
-};
-
-const InitialContext = struct {
-    allocator: *mem.Allocator,
-    callback: callback_t,
-    buffer_allocator: buffer_pool_t,
-};
+const Context = @import("context.zig").Context;
+const callback_t = @import("constants.zig").callback_t;
+const buffer_pool_t = @import("constants.zig").buffer_pool_t;
+const request_pool_t = @import("constants.zig").request_pool_t;
+const response_pool_t = @import("constants.zig").response_pool_t;
+const client_pool_t = @import("constants.zig").client_pool_t;
+const context_pool_t = @import("constants.zig").context_pool_t;
+const write_req_pool_t = @import("constants.zig").write_req_pool_t;
 
 fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
-    const initial_ctx: *InitialContext = @ptrCast(@alignCast(server.*.data));
-    const main_allocator = initial_ctx.*.allocator;
-
-    const ctx = main_allocator.*.create(Context) catch {
-        print("Failed to create context\n", .{});
-        return;
-    };
-
-    ctx.*.callback = initial_ctx.*.callback;
-    ctx.*.buffer_allocator = initial_ctx.*.buffer_allocator;
-
-    const arena = main_allocator.*.create(std.heap.ArenaAllocator) catch {
-        print("Failed to create arena allocator\n", .{});
-        return;
-    };
-    arena.* = std.heap.ArenaAllocator.init(main_allocator.*);
-    const allocator = arena.allocator();
+    const ctx: *Context = @ptrCast(@alignCast(server.*.data));
+    const client_pool = ctx.client_allocator;
 
     if (status < 0) {
         print("New connection error {s}\n", .{uv.uv_strerror(status)});
-        arena.deinit();
-        main_allocator.*.destroy(arena);
         return;
     }
 
-    const client: [*c]uv.uv_tcp_t = allocator.create(uv.uv_tcp_t) catch {
+    const client: [*c]uv.uv_tcp_t = client_pool.create() catch {
         print("Failed to allocate client\n", .{});
-        arena.deinit();
-        main_allocator.*.destroy(arena);
         return;
     };
 
     _ = uv.uv_tcp_init(server.*.loop, client);
-    ctx.*.arena = arena;
     client.*.data = ctx;
 
     if (uv.uv_accept(server, @ptrCast(client)) == 0) {
         _ = uv.uv_read_start(@ptrCast(client), alloc_buffer, on_read);
-    } else {
-        arena.deinit();
-        main_allocator.destroy(arena);
     }
 }
 
 fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
     const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
     const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
-    const arena_ptr: *std.heap.ArenaAllocator = ctx.*.arena;
-    const allocator = arena_ptr.*.allocator();
+    const main_allocator = ctx.*.allocator;
     var buffer_pool = ctx.*.buffer_allocator;
+    var request_pool = ctx.*.request_allocator;
+    var response_pool = ctx.*.response_allocator;
+    var write_req_pool = ctx.*.write_req_allocator;
+
+    defer {
+        if (buf.*.base != null) {
+            buffer_pool.destroy(@ptrCast(@alignCast(buf.*.base)));
+        }
+    }
 
     if (nread < 0) {
         if (nread != uv.UV_EOF) {
             print("Read error: {s}\n", .{uv.uv_strerror(@intCast(nread))});
         }
-        _ = uv.uv_close(@ptrCast(@alignCast(client)), null);
-        buffer_pool.destroy(@ptrCast(@alignCast(buf.*.base)));
+        _ = uv.uv_close(@ptrCast(@alignCast(client)), on_close);
     }
 
     if (nread > 0) {
+        var arena = std.heap.ArenaAllocator.init(main_allocator.*);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
         const request_raw = buf.*.base[0..@intCast(nread)];
 
-        const request = allocator.create(Request) catch {
+        const request = request_pool.create() catch {
             print("Failed to allocate request\n", .{});
             return;
         };
@@ -95,12 +77,20 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             print("Failed to parse request\n", .{});
             return;
         };
+        defer {
+            request.*.deinit();
+            request_pool.destroy(request);
+        }
 
-        const response = allocator.create(Response) catch {
+        const response = response_pool.create() catch {
             print("Failed to allocate response\n", .{});
             return;
         };
         response.* = Response.init(allocator);
+        defer {
+            response.*.deinit();
+            response_pool.destroy(response);
+        }
 
         ctx.*.callback(allocator, request, response) catch {
             return;
@@ -111,7 +101,7 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             return;
         };
 
-        const write_req = allocator.create(uv.uv_write_t) catch {
+        const write_req = write_req_pool.create() catch {
             print("Failed to allocate write_req\n", .{});
             return;
         };
@@ -124,11 +114,14 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             1,
             on_write_complete,
         );
-        buffer_pool.destroy(@ptrCast(@alignCast(buf.*.base)));
     }
 }
 
 fn on_write_complete(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
+    const ctx: *Context = @ptrCast(@alignCast(req.*.handle.*.data));
+    var write_req_pool = ctx.*.write_req_allocator;
+    defer write_req_pool.destroy(req);
+
     if (status < 0) {
         print("Write error: {s}\n", .{uv.uv_strerror(status)});
     }
@@ -137,8 +130,10 @@ fn on_write_complete(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
 
 fn on_close(handle: [*c]uv.uv_handle_t) callconv(.C) void {
     const ctx: *Context = @ptrCast(@alignCast(handle.*.data));
-    const arena_ptr: *std.heap.ArenaAllocator = ctx.*.arena;
-    _ = arena_ptr.*.deinit();
+
+    const client_pool = ctx.client_allocator;
+    const client: *uv.uv_tcp_t = @alignCast(@ptrCast(handle));
+    client_pool.*.destroy(client);
 }
 
 fn alloc_buffer(handle: [*c]uv.uv_handle_t, _: usize, buf: [*c]uv.uv_buf_t) callconv(.c) void {
@@ -150,14 +145,48 @@ fn alloc_buffer(handle: [*c]uv.uv_handle_t, _: usize, buf: [*c]uv.uv_buf_t) call
         return;
     };
 
-    buf.* = uv.uv_buf_init(memory.ptr,@intCast(suggested_buffer_size));
+    buf.* = uv.uv_buf_init(memory.ptr, @intCast(suggested_buffer_size));
 }
 
 pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_t) !void {
-    const ctx: *InitialContext = try allocator.*.create(InitialContext);
+    const ctx: *Context = try allocator.*.create(Context);
     ctx.*.allocator = allocator;
     ctx.*.callback = callback;
-    ctx.*.buffer_allocator = try buffer_pool_t.initPreheated(allocator.*, 1024);
+
+    ctx.*.buffer_allocator = try allocator.*.create(buffer_pool_t);
+    ctx.*.buffer_allocator.* = try buffer_pool_t.initPreheated(allocator.*, 1024);
+    defer {
+        ctx.*.buffer_allocator.deinit();
+        allocator.*.destroy(ctx.*.buffer_allocator);
+    }
+
+    ctx.*.request_allocator = try allocator.*.create(request_pool_t);
+    ctx.*.request_allocator.* = try request_pool_t.initPreheated(allocator.*, 1024);
+    defer {
+        ctx.*.request_allocator.deinit();
+        allocator.*.destroy(ctx.*.request_allocator);
+    }
+
+    ctx.*.response_allocator = try allocator.*.create(response_pool_t);
+    ctx.*.response_allocator.* = try response_pool_t.initPreheated(allocator.*, 1024);
+    defer {
+        ctx.*.response_allocator.deinit();
+        allocator.*.destroy(ctx.*.response_allocator);
+    }
+
+    ctx.*.client_allocator = try allocator.*.create(client_pool_t);
+    ctx.*.client_allocator.* = try client_pool_t.initPreheated(allocator.*, 1024);
+    defer {
+        ctx.*.client_allocator.deinit();
+        allocator.*.destroy(ctx.*.client_allocator);
+    }
+
+    ctx.*.write_req_allocator = try allocator.*.create(write_req_pool_t);
+    ctx.*.write_req_allocator.* = try write_req_pool_t.initPreheated(allocator.*, 1024);
+    defer {
+        ctx.*.write_req_allocator.deinit();
+        allocator.*.destroy(ctx.*.write_req_allocator);
+    }
 
     print("Started server\n", .{});
 
