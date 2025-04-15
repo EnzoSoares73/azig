@@ -10,25 +10,36 @@ pub const Request = struct {
     version: []const u8,
     headers: StringHashMap([]const u8),
     body: ?[]const u8,
+    is_init: bool = false,
 
     const Self = @This();
 
-    pub fn init(allocator: mem.Allocator, request_raw: []u8) !Self {
-        const map = StringHashMap([]const u8).init(allocator);
-        var request = Self{
+    pub fn init(allocator: mem.Allocator) !Self {
+        var map = StringHashMap([]const u8).init(allocator);
+        try map.ensureTotalCapacity(3);
+        return Self{
             .body = null,
             .headers = map,
             .method = undefined,
             .path = undefined,
             .version = undefined,
+            .is_init = true,
         };
-        try parseRequest(&request, allocator, request_raw);
-        return request;
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
         self.* = undefined;
+        self.*.is_init = false;
+    }
+
+    pub fn reset(self: *Self) void {
+        self.*.body = null;
+        self.*.method = undefined;
+        self.*.path = undefined;
+        self.*.version = undefined;
+        self.*.headers.clearRetainingCapacity();
+        self.*.is_init = true;
     }
 
     pub fn printSelf(self: Self) void {
@@ -52,14 +63,14 @@ pub const Request = struct {
         return self.headers.get(name);
     }
 
-    fn parseRequest(self: *Self, allocator: mem.Allocator, request_raw: []u8) !void {
+    pub fn parseRequest(self: *Self, request_raw: []u8) !void {
         var request_iter = mem.tokenizeSequence(u8, request_raw, "\r\n\r\n");
         const raw_headers = request_iter.next() orelse "";
-        try parseHeaders(self, allocator, raw_headers);
+        try parseHeaders(self, raw_headers);
         self.*.body = request_iter.next() orelse null;
     }
 
-    fn parseHeaders(self: *Self, allocator: mem.Allocator, raw_headers: []const u8) !void {
+    fn parseHeaders(self: *Self, raw_headers: []const u8) !void {
         const first_line_end = mem.indexOfScalar(u8, raw_headers, '\n') orelse raw_headers.len;
         const first_line = mem.trim(u8, raw_headers[0..first_line_end], "\r");
 
@@ -73,7 +84,7 @@ pub const Request = struct {
         var headers = raw_headers[first_line_end + 1 ..];
         while (headers.len > 0) {
             const line_end = mem.indexOfScalar(u8, headers, '\n') orelse headers.len;
-            const line = mem.trim(u8, headers[0..line_end], "\r");
+            var line = mem.trim(u8, headers[0..line_end], "\r");
 
             if (line.len > 0) {
                 const colon = mem.indexOfScalar(u8, line, ':') orelse {
@@ -87,7 +98,8 @@ pub const Request = struct {
                 else
                     "";
 
-                try self.*.headers.put(try capitalizeHeaderName(allocator, name), value);
+                capitalizeHeaderName(@constCast(name));
+                try self.*.headers.put(name, value);
             }
 
             if (line_end + 1 > headers.len) {
@@ -97,19 +109,16 @@ pub const Request = struct {
         }
     }
 
-    fn capitalizeHeaderName(allocator: mem.Allocator, name: []const u8) ![]u8 {
-        var result = try allocator.alloc(u8, name.len);
+    fn capitalizeHeaderName(name: []u8) void {
         var capitalize = true;
-
-        for (name, 0..) |c, i| {
-            if (capitalize and ascii.isAlphabetic(c)) {
-                result[i] = ascii.toUpper(c);
+        for (name) |*c| {
+            if (capitalize and ascii.isAlphabetic(c.*)) {
+                c.* = ascii.toUpper(c.*);
                 capitalize = false;
             } else {
-                result[i] = ascii.toLower(c);
-                capitalize = c == '-';
+                c.* = ascii.toLower(c.*);
+                capitalize = (c.* == '-');
             }
         }
-        return result;
     }
 };

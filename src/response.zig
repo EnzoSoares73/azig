@@ -7,11 +7,13 @@ pub const Response = struct {
     status_code: u16,
     headers: StringHashMap([]const u8),
     body: ?[]const u8,
+    is_init: bool = false,
 
     const Self = @This();
 
-    pub fn init(allocator: mem.Allocator) Self {
-        const map = StringHashMap([]const u8).init(allocator);
+    pub fn init(allocator: mem.Allocator) !Self {
+        var map = StringHashMap([]const u8).init(allocator);
+        try map.ensureTotalCapacity(3);
         return Self{
             .body = null,
             .headers = map,
@@ -23,7 +25,14 @@ pub const Response = struct {
         self.headers.deinit();
         self.* = undefined;
     }
-    
+
+    pub fn reset(self: *Self) void {
+        self.*.body = null;
+        self.*.status_code = 200;
+        self.*.headers.clearRetainingCapacity();
+        self.*.is_init = true;
+    }
+
     pub fn addHeader(self: *Self, name: []u8, value: []u8) !void {
         try self.*.headers.put(name, value);
     }
@@ -45,7 +54,7 @@ pub const Response = struct {
 
         var headers_iter = self.*.headers.iterator();
         while (headers_iter.next()) |entry| {
-            try writer.print("{s}: {s}\r\n", .{entry.key_ptr.*, entry.value_ptr.*});
+            try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
 
         try writer.writeAll("\r\n");

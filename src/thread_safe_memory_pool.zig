@@ -8,15 +8,10 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
     return struct {
         const Pool = @This();
 
-        /// Size of the memory pool items. This is not necessarily the same
-        /// as `@sizeOf(Item)` as the pool also uses the items for internal means.
         pub const item_size = @max(@sizeOf(Node), @sizeOf(Item));
 
-        // This needs to be kept in sync with Node.
         const node_alignment = @alignOf(*anyopaque);
 
-        /// Alignment of the memory pool items. This is not necessarily the same
-        /// as `@alignOf(Item)` as the pool also uses the items for internal means.
         pub const item_alignment = @max(node_alignment, pool_options.alignment orelse @alignOf(Item));
 
         const Node = struct {
@@ -29,14 +24,10 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         free_list: ?NodePtr = null,
         mutex: std.Thread.Mutex,
 
-        /// Creates a new memory pool.
         pub fn init(allocator: std.mem.Allocator) Pool {
             return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = Mutex{} };
         }
 
-        /// Creates a new memory pool and pre-allocates `initial_size` items.
-        /// This allows the up to `initial_size` active allocations before a
-        /// `OutOfMemory` error happens when calling `create()`.
         pub fn initPreheated(allocator: std.mem.Allocator, initial_size: usize) MemoryPoolError!Pool {
             var pool = init(allocator);
             errdefer pool.deinit();
@@ -44,15 +35,11 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
             return pool;
         }
 
-        /// Destroys the memory pool and frees all allocated memory.
         pub fn deinit(pool: *Pool) void {
             pool.arena.deinit();
             pool.* = undefined;
         }
 
-        /// Preheats the memory pool by pre-allocating `size` items.
-        /// This allows up to `size` active allocations before an
-        /// `OutOfMemory` error might happen when calling `create()`.
         pub fn preheat(pool: *Pool, size: usize) MemoryPoolError!void {
             var i: usize = 0;
             while (i < size) : (i += 1) {
@@ -77,9 +64,6 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         ///
         /// NOTE: If `mode` is `free_all`, the function will always return `true`.
         pub fn reset(pool: *Pool, mode: ResetMode) bool {
-            // TODO: Potentially store all allocated objects in a list as well, allowing to
-            //       just move them into the free list instead of actually releasing the memory.
-
             const reset_successful = pool.arena.reset(mode);
 
             pool.free_list = null;
@@ -87,8 +71,10 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
             return reset_successful;
         }
 
-        /// Creates a new item and adds it to the memory pool.
         pub fn create(pool: *Pool) !ItemPtr {
+            pool.*.mutex.lock();
+            defer pool.*.mutex.unlock();
+
             const node = if (pool.free_list) |item| blk: {
                 pool.free_list = item.next;
                 break :blk item;
@@ -102,9 +88,9 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
             return ptr;
         }
 
-        /// Destroys a previously created item.
-        /// Only pass items to `ptr` that were previously created with `create()` of the same memory pool!
         pub fn destroy(pool: *Pool, ptr: ItemPtr) void {
+            pool.*.mutex.lock();
+            defer pool.*.mutex.unlock();
             ptr.* = undefined;
 
             const node = @as(NodePtr, @ptrCast(ptr));
@@ -117,7 +103,7 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
 
         fn allocNew(pool: *Pool) MemoryPoolError!*align(item_alignment) [item_size]u8 {
             const mem = try pool.arena.allocator().alignedAlloc(u8, item_alignment, item_size);
-            return mem[0..item_size]; // coerce slice to array pointer
+            return mem[0..item_size];
         }
     };
 }
