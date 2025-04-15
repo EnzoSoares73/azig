@@ -64,48 +64,39 @@ pub const Request = struct {
     }
 
     pub fn parseRequest(self: *Self, request_raw: []u8) !void {
-        var request_iter = mem.tokenizeSequence(u8, request_raw, "\r\n\r\n");
-        const raw_headers = request_iter.next() orelse "";
-        try parseHeaders(self, raw_headers);
-        self.*.body = request_iter.next() orelse null;
-    }
+        var i: usize = 0;
 
-    fn parseHeaders(self: *Self, raw_headers: []const u8) !void {
-        const first_line_end = mem.indexOfScalar(u8, raw_headers, '\n') orelse raw_headers.len;
-        const first_line = mem.trim(u8, raw_headers[0..first_line_end], "\r");
+        const method_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return error.InvalidRequest;
+        self.method = request_raw[i .. i + method_end];
+        i += method_end + 1;
 
-        {
-            var iter = mem.splitScalar(u8, first_line, ' ');
-            self.*.method = iter.next() orelse "";
-            self.*.path = iter.next() orelse "";
-            self.*.version = iter.next() orelse "";
-        }
+        const path_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return error.InvalidRequest;
+        self.path = request_raw[i .. i + path_end];
+        i += path_end + 1;
 
-        var headers = raw_headers[first_line_end + 1 ..];
-        while (headers.len > 0) {
-            const line_end = mem.indexOfScalar(u8, headers, '\n') orelse headers.len;
-            var line = mem.trim(u8, headers[0..line_end], "\r");
+        const version_end = std.mem.indexOfScalar(u8, request_raw[i..], '\n') orelse return error.InvalidRequest;
+        self.version = request_raw[i .. i + version_end];
+        i += version_end + 2;
 
-            if (line.len > 0) {
-                const colon = mem.indexOfScalar(u8, line, ':') orelse {
-                    headers = headers[line_end + 1 ..];
-                    continue;
-                };
-
-                const name = mem.trim(u8, line[0..colon], " ");
-                const value = if (colon + 1 < line.len)
-                    mem.trim(u8, line[colon + 1 ..], " ")
-                else
-                    "";
-
-                capitalizeHeaderName(@constCast(name));
-                try self.*.headers.put(name, value);
-            }
-
-            if (line_end + 1 > headers.len) {
+        while (i < request_raw.len) {
+            if (i + 1 < request_raw.len and request_raw[i] == '\r' and request_raw[i + 1] == '\n') {
+                i += 2;
                 break;
             }
-            headers = headers[line_end + 1 ..];
+
+            const line_end = std.mem.indexOfScalarPos(u8, request_raw, i, '\r') orelse return error.InvalidRequest;
+            const colon_pos = std.mem.indexOfScalar(u8, request_raw[i..line_end], ':') orelse return error.InvalidHeader;
+
+            const key = std.mem.trim(u8, request_raw[i .. i + colon_pos], " ");
+            const value = std.mem.trim(u8, request_raw[i + colon_pos + 1 .. line_end], " ");
+
+            capitalizeHeaderName(@constCast(key));
+            try self.*.headers.put(key, value);
+            i = line_end + 2;
+        }
+
+        if (i < request_raw.len) {
+            self.*.body = request_raw[i..];
         }
     }
 
