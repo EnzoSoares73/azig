@@ -3,6 +3,11 @@ const print = std.debug.print;
 const StringHashMap = std.StringHashMap;
 const mem = std.mem;
 
+pub const ResponseString = struct {
+    string: []const u8,
+    in_heap: bool,
+};
+
 pub const Response = struct {
     status_code: u16,
     headers: StringHashMap([]const u8),
@@ -18,6 +23,7 @@ pub const Response = struct {
             .body = null,
             .headers = map,
             .status_code = 200,
+            .is_init = true,
         };
     }
 
@@ -37,33 +43,91 @@ pub const Response = struct {
         try self.*.headers.put(name, value);
     }
 
-    pub fn to_string(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var response_string = std.ArrayList(u8).init(allocator);
-        defer response_string.deinit();
+    pub fn to_string(self: *Self, allocator: std.mem.Allocator) !ResponseString {
+        const size = try self.calculate_serialized_size();
 
-        const writer = response_string.writer();
+        if (size < 4096) {
+            var buffer: [4096]u8 = undefined;
+            return .{
+                .string = try self.write_to_buffer(&buffer),
+                .in_heap = false
+            };
+        } else {
+            const buffer = try allocator.alloc(u8, size);
+            errdefer allocator.free(buffer);
 
+            var stream = std.io.fixedBufferStream(buffer);
+            try self.write_to_stream(stream.writer());
+
+            return .{
+                .string = buffer,
+                .in_heap = true
+            };
+        }
+    }
+
+    fn calculate_serialized_size(self: *Self) !usize {
+        var size: usize = 0;
+
+        const status_text = statusCodeToString(self.status_code) orelse "Unknown";
+        size += "HTTP/1.1 ".len;
+        size += std.fmt.count("{d}", .{self.status_code});
+        size += " ".len;
+        size += status_text.len;
+        size += "\r\n".len;
+
+        var headers_iter = self.headers.iterator();
+        while (headers_iter.next()) |entry| {
+            size += entry.key_ptr.len;
+            size += ": ".len;
+            size += entry.value_ptr.len;
+            size += "\r\n".len;
+        }
+
+        const content_length = "Content-Length";
+        const len = if (self.body) |b| b.len else 0;
+        size += content_length.len;
+        size += ": ".len;
+        size += std.fmt.count("{d}", .{len});
+        size += "\r\n".len;
+
+        size += "\r\n".len;
+
+        if (self.body) |b| {
+            size += b.len;
+        }
+
+        return size;
+    }
+
+    fn write_to_stream(self: *Self, writer: anytype) !void {
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
-            self.*.status_code,
+            self.status_code,
             statusCodeToString(self.status_code) orelse "Unknown",
         });
 
-        const content_length = "Content-Length";
-        const len = if (self.*.body) |body| body.len else 0;
-        try self.*.addHeader(@constCast(content_length), try std.fmt.allocPrint(allocator, "{d}", .{len}));
-
-        var headers_iter = self.*.headers.iterator();
+        var headers_iter = self.headers.iterator();
         while (headers_iter.next()) |entry| {
-            try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try writer.print("{s}: {s}\r\n", .{entry.key_ptr.*, entry.value_ptr.*});
         }
+
+        const len = if (self.body) |b| b.len else 0;
+        try writer.print("Content-Length: {d}\r\n", .{len});
 
         try writer.writeAll("\r\n");
 
-        if (self.*.body) |body| {
-            try writer.writeAll(body);
+        if (self.body) |b| {
+            try writer.writeAll(b);
         }
+    }
 
-        return response_string.toOwnedSlice();
+    fn write_to_buffer(self: *Self, buffer: []u8) ![]const u8 {
+        var stream = std.io.fixedBufferStream(buffer);
+        const writer = stream.writer();
+
+        try write_to_stream(self, writer);
+
+        return buffer[0..stream.pos];
     }
 
     fn statusCodeToString(code: u16) ?[]const u8 {

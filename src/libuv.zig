@@ -107,7 +107,9 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             print("Failed to write response\n", .{});
             return;
         };
-        defer allocator.free(response_text);
+        if (response_text.in_heap) {
+            defer allocator.free(response_text.string);
+        }
 
         const write_req = write_req_pool.create() catch {
             print("Failed to allocate write_req\n", .{});
@@ -123,7 +125,7 @@ fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callcon
             }
         }
 
-        var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text)), @intCast(response_text.len));
+        var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
         _ = uv.uv_write(
             write_req,
             stream,
