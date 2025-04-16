@@ -1,5 +1,4 @@
 .zig-cache
-*.md
 .idea
 zig-out
 vcpkg
