@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) !void {
-
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
@@ -22,6 +21,16 @@ pub fn build(b: *std.Build) !void {
 
     if (target.result.os.tag == .windows and optimize == .Debug) {
         exe.linkSystemLibrary("ucrtbased");
+    }
+
+    {
+        const module = b.addModule("azig", .{
+            .root_source_file = b.path("src/azig.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        module.linkLibrary(libuv_dep.artifact("uv"));
+        module.linkSystemLibrary("ucrtbased", .{});
     }
 
     b.installArtifact(exe);
