@@ -9,6 +9,9 @@ const ThreadSafeMemoryPool = @import("thread_safe_memory_pool.zig").ThreadSafeMe
 pub const DEFAULT_PORT: u16 = 2500;
 
 pub fn callback_t(comptime AppContext: type) type {
+    if (AppContext == void) {
+        return * const fn (mem.Allocator, *Request, *Response) anyerror!void;
+    }
     return * const fn (mem.Allocator, *AppContext, *Request, *Response) anyerror!void;
 }
 

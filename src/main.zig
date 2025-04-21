@@ -10,5 +10,5 @@ pub fn main() !void {
     try server.start();
 }
 
-fn on_response(_: std.mem.Allocator, _: *void, _: *azig.Request, _: *azig.Response) !void {
+fn on_response(_: std.mem.Allocator, _: *azig.Request, _: *azig.Response) !void {
 }

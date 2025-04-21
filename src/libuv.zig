@@ -105,9 +105,15 @@ pub fn libuv(comptime AppContext: type) type {
                     response_pool.destroy(response);
                 }
 
-                ctx.*.callback(allocator, app_context, request, response) catch {
-                    return;
-                };
+                if (AppContext == void) {
+                    ctx.*.callback(allocator, request, response) catch {
+                        return;
+                    };
+                } else {
+                    ctx.*.callback(allocator, app_context, request, response) catch {
+                        return;
+                    };
+                }
 
                 const response_text = response.to_string(allocator) catch {
                     print("Failed to write response\n", .{});
