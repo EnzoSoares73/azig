@@ -6,6 +6,7 @@ const response_pool_t = @import("constants.zig").response_pool_t;
 const client_pool_t = @import("constants.zig").client_pool_t;
 const write_req_pool_t = @import("constants.zig").write_req_pool_t;
 const context_pool_t = @import("constants.zig").context_pool_t;
+const header_t = @import("constants.zig").header_t;
 
 pub fn context_t(comptime AppContext: type) type {
     return struct {
@@ -16,6 +17,7 @@ pub fn context_t(comptime AppContext: type) type {
         response_allocator: *response_pool_t,
         client_allocator: *client_pool_t,
         write_req_allocator: *write_req_pool_t,
+        header_allocator: *header_t,
         app_context: *AppContext
     };
 }

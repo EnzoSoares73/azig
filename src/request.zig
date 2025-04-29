@@ -3,6 +3,7 @@ const print = std.debug.print;
 const StringHashMap = std.StringHashMap;
 const mem = std.mem;
 const ascii = std.ascii;
+const header_t = @import("constants.zig").header_t;
 
 pub const Request = struct {
     method: []const u8,
@@ -13,20 +14,19 @@ pub const Request = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: mem.Allocator) !Self {
-        var map = StringHashMap([]const u8).init(allocator);
-        try map.ensureTotalCapacity(3);
+    pub fn init(header_pool: *header_t) !Self {
+        const map = try header_pool.*.create();
         return Self{
             .body = null,
-            .headers = map,
+            .headers = map.*,
             .method = undefined,
             .path = undefined,
             .version = undefined,
         };
     }
 
-    pub fn deinit(self: *Self) void {
-        self.headers.deinit();
+    pub fn deinit(self: *Self, header_pool: *header_t) !void {
+        try header_pool.*.destroy(&self.*.headers);
         self.* = undefined;
     }
 

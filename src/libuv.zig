@@ -17,6 +17,7 @@ const response_pool_t = @import("constants.zig").response_pool_t;
 const client_pool_t = @import("constants.zig").client_pool_t;
 const context_pool_t = @import("constants.zig").context_pool_t;
 const write_req_pool_t = @import("constants.zig").write_req_pool_t;
+const header_t = @import("constants.zig").header_t;
 
 pub fn libuv(comptime AppContext: type) type {
     const Context = context_t(AppContext);
@@ -52,6 +53,7 @@ pub fn libuv(comptime AppContext: type) type {
             var request_pool = ctx.*.request_allocator;
             var response_pool = ctx.*.response_allocator;
             var write_req_pool = ctx.*.write_req_allocator;
+            const header_pool = ctx.*.header_allocator;
             const app_context = ctx.*.app_context;
 
             defer {
@@ -75,7 +77,7 @@ pub fn libuv(comptime AppContext: type) type {
                     print("Failed to allocate request\n", .{});
                     return;
                 };
-                request.* = Request.init(allocator) catch {
+                request.* = Request.init(header_pool) catch {
                     print("Failed to init request\n", .{});
                     return;
                 };
@@ -84,7 +86,9 @@ pub fn libuv(comptime AppContext: type) type {
                     return;
                 };
                 defer {
-                    request.*.deinit();
+                    request.*.deinit(header_pool) catch {
+                        print("Failed to deinit request\n", .{});
+                    };
                     request_pool.destroy(request);
                 }
 
@@ -92,12 +96,14 @@ pub fn libuv(comptime AppContext: type) type {
                     print("Failed to allocate response\n", .{});
                     return;
                 };
-                response.* = Response.init(allocator) catch {
+                response.* = Response.init(header_pool) catch {
                     print("Failed to create response\n", .{});
                     return;
                 };
                 defer {
-                    response.*.deinit();
+                    response.*.deinit(header_pool) catch {
+                        print("Failed to deinit response\n", .{});
+                    };
                     response_pool.destroy(response);
                 }
 
@@ -186,23 +192,24 @@ pub fn libuv(comptime AppContext: type) type {
             buf.* = uv.uv_buf_init(memory.ptr, @intCast(suggested_buffer_size));
         }
 
-        fn init_pools(allocator: mem.Allocator, ctx: *Context) !*const fn (allocator: mem.Allocator, ctx: *Context) void {
-            const initial_size: usize = 1024;
-
+        fn init_pools(allocator: mem.Allocator, ctx: *Context, pool_size: u16) !*const fn (allocator: mem.Allocator, ctx: *Context) void {
             ctx.*.buffer_allocator = try allocator.create(buffer_pool_t);
-            ctx.*.buffer_allocator.* = try buffer_pool_t.initPreheated(allocator, initial_size);
+            ctx.*.buffer_allocator.* = try buffer_pool_t.initPreheated(allocator, pool_size);
 
             ctx.*.request_allocator = try allocator.create(request_pool_t);
-            ctx.*.request_allocator.* = try request_pool_t.initPreheated(allocator, initial_size);
+            ctx.*.request_allocator.* = try request_pool_t.initPreheated(allocator, pool_size);
 
             ctx.*.response_allocator = try allocator.create(response_pool_t);
-            ctx.*.response_allocator.* = try response_pool_t.initPreheated(allocator, initial_size);
+            ctx.*.response_allocator.* = try response_pool_t.initPreheated(allocator, pool_size);
 
             ctx.*.client_allocator = try allocator.create(client_pool_t);
-            ctx.*.client_allocator.* = try client_pool_t.initPreheated(allocator, initial_size);
+            ctx.*.client_allocator.* = try client_pool_t.initPreheated(allocator, pool_size);
 
             ctx.*.write_req_allocator = try allocator.create(write_req_pool_t);
-            ctx.*.write_req_allocator.* = try write_req_pool_t.initPreheated(allocator, initial_size);
+            ctx.*.write_req_allocator.* = try write_req_pool_t.initPreheated(allocator, pool_size);
+
+            ctx.*.header_allocator = try allocator.create(header_t);
+            ctx.*.header_allocator.* = try header_t.initPreheated(allocator, pool_size * 2);
 
             return struct {
                 fn clean(allocator_inner: mem.Allocator, ctx_inner: *Context) void {
@@ -220,6 +227,9 @@ pub fn libuv(comptime AppContext: type) type {
 
                     ctx_inner.*.write_req_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.write_req_allocator);
+
+                    ctx_inner.*.header_allocator.deinit();
+                    allocator_inner.destroy(ctx_inner.*.header_allocator);
                 }
             }.clean;
         }
@@ -230,7 +240,7 @@ pub fn libuv(comptime AppContext: type) type {
             ctx.*.callback = callback;
             ctx.*.app_context = app_context;
 
-            const cleanup = try init_pools(allocator.*, ctx);
+            const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
 
             print("Started server\n", .{});
