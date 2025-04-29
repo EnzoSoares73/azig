@@ -9,7 +9,7 @@ pub const Request = struct {
     method: []const u8,
     path: []const u8,
     version: []const u8,
-    headers: StringHashMap([]const u8),
+    headers: *StringHashMap([]const u8),
     body: ?[]const u8,
 
     const Self = @This();
@@ -18,7 +18,7 @@ pub const Request = struct {
         const map = try header_pool.*.create();
         return Self{
             .body = null,
-            .headers = map.*,
+            .headers = map,
             .method = undefined,
             .path = undefined,
             .version = undefined,
@@ -26,14 +26,14 @@ pub const Request = struct {
     }
 
     pub fn deinit(self: *Self, header_pool: *header_t) !void {
-        try header_pool.*.destroy(&self.*.headers);
+        try header_pool.*.destroy(self.*.headers);
         self.* = undefined;
     }
 
     pub fn printSelf(self: Self) void {
         print("{s} {s} {s}\n", .{ self.method, self.path, self.version });
 
-        var iter = self.headers.iterator();
+        var iter = self.headers.*.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
             const value = entry.value_ptr.*;
@@ -48,7 +48,7 @@ pub const Request = struct {
     }
 
     pub fn getHeader(self: Self, name: []u8) ?[]const u8 {
-        return self.headers.get(name);
+        return self.headers.*.get(name);
     }
 
     pub fn parseRequest(self: *Self, request_raw: []u8) !void {
@@ -79,7 +79,7 @@ pub const Request = struct {
             const value = std.mem.trim(u8, request_raw[i + colon_pos + 1 .. line_end], " ");
 
             capitalizeHeaderName(@constCast(key));
-            try self.*.headers.put(key, value);
+            try self.*.headers.*.put(key, value);
             i = line_end + 2;
         }
 

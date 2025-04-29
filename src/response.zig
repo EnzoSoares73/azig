@@ -11,7 +11,7 @@ pub const ResponseString = struct {
 
 pub const Response = struct {
     status_code: u16,
-    headers: StringHashMap([]const u8),
+    headers: *StringHashMap([]const u8),
     body: ?[]const u8,
 
     const Self = @This();
@@ -20,18 +20,18 @@ pub const Response = struct {
         const map = try header_pool.*.create();
         return Self{
             .body = null,
-            .headers = map.*,
+            .headers = map,
             .status_code = 200,
         };
     }
 
     pub fn deinit(self: *Self, header_pool: *header_t) !void {
-        try header_pool.*.destroy(&self.*.headers);
+        try header_pool.*.destroy(self.*.headers);
         self.* = undefined;
     }
 
     pub fn addHeader(self: *Self, name: []u8, value: []u8) !void {
-        try self.*.headers.put(name, value);
+        try self.*.headers.*.put(name, value);
     }
 
     pub fn to_string(self: *Self, allocator: std.mem.Allocator) !ResponseString {
@@ -67,7 +67,7 @@ pub const Response = struct {
         size += status_text.len;
         size += "\r\n".len;
 
-        var headers_iter = self.headers.iterator();
+        var headers_iter = self.headers.*.iterator();
         while (headers_iter.next()) |entry| {
             size += entry.key_ptr.len;
             size += ": ".len;
@@ -97,7 +97,7 @@ pub const Response = struct {
             statusCodeToString(self.status_code) orelse "Unknown",
         });
 
-        var headers_iter = self.headers.iterator();
+        var headers_iter = self.headers.*.iterator();
         while (headers_iter.next()) |entry| {
             try writer.print("{s}: {s}\r\n", .{entry.key_ptr.*, entry.value_ptr.*});
         }

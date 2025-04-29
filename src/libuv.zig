@@ -124,13 +124,13 @@ pub fn libuv(comptime AppContext: type) type {
                     stream,
                     &buf_resp,
                     1,
-                    if (is_keep_alive(request.*)) on_write_complete_keep_alive else on_write_complete_no_keep_alive,
+                    if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive,
                 );
             }
         }
 
-        fn is_keep_alive(request: Request) bool {
-            const connection_header = request.getHeader(@constCast("Connection"));
+        fn is_keep_alive(request: *Request) bool {
+            const connection_header = request.*.getHeader(@constCast("Connection"));
 
             if (connection_header) |header| {
                 if (!std.ascii.eqlIgnoreCase(header, "keep-alive")) {
