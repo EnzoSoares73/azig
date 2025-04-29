@@ -22,6 +22,10 @@ const header_t = @import("constants.zig").header_t;
 pub fn libuv(comptime AppContext: type) type {
     const Context = context_t(AppContext);
 
+    const init_request_t = struct { request: *Request, cleanup: *const fn (*Request, *header_t, *request_pool_t) anyerror!void };
+
+    const init_response_t = struct { response: *Response, cleanup: *const fn (*Response, *header_t, *response_pool_t) anyerror!void };
+
     return struct {
         fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
             const ctx: *Context = @ptrCast(@alignCast(server.*.data));
@@ -50,8 +54,8 @@ pub fn libuv(comptime AppContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
             const main_allocator = ctx.*.allocator;
             var buffer_pool = ctx.*.buffer_allocator;
-            var request_pool = ctx.*.request_allocator;
-            var response_pool = ctx.*.response_allocator;
+            const request_pool = ctx.*.request_allocator;
+            const response_pool = ctx.*.response_allocator;
             var write_req_pool = ctx.*.write_req_allocator;
             const header_pool = ctx.*.header_allocator;
             const app_context = ctx.*.app_context;
@@ -73,39 +77,23 @@ pub fn libuv(comptime AppContext: type) type {
                 const allocator = main_allocator.*;
                 const request_raw = buf.*.base[0..@intCast(nread)];
 
-                const request = request_pool.create() catch {
-                    print("Failed to allocate request\n", .{});
+                const request_struct = start_request(request_raw, header_pool, request_pool) catch {
+                    print("There was an error initializing the request", .{});
                     return;
                 };
-                request.* = Request.init(header_pool) catch {
-                    print("Failed to init request\n", .{});
-                    return;
+                const request = request_struct.request;
+                defer request_struct.cleanup(request, header_pool, request_pool) catch {
+                    print("Failed to deinit request\n", .{});
                 };
-                request.*.parseRequest(request_raw) catch {
-                    print("Failed to parse request\n", .{});
-                    return;
-                };
-                defer {
-                    request.*.deinit(header_pool) catch {
-                        print("Failed to deinit request\n", .{});
-                    };
-                    request_pool.destroy(request);
-                }
 
-                const response = response_pool.create() catch {
-                    print("Failed to allocate response\n", .{});
+                const response_struct = start_response(header_pool, response_pool) catch {
+                    print("There was an error initializing the response", .{});
                     return;
                 };
-                response.* = Response.init(header_pool) catch {
-                    print("Failed to create response\n", .{});
-                    return;
+                const response = response_struct.response;
+                defer response_struct.cleanup(response, header_pool, response_pool) catch {
+                    print("Failed to deinit response\n", .{});
                 };
-                defer {
-                    response.*.deinit(header_pool) catch {
-                        print("Failed to deinit response\n", .{});
-                    };
-                    response_pool.destroy(response);
-                }
 
                 if (AppContext == void) {
                     ctx.*.callback(allocator, request, response) catch {
@@ -173,6 +161,30 @@ pub fn libuv(comptime AppContext: type) type {
                 print("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
             _ = uv.uv_close(@ptrCast(req.*.handle), on_close);
+        }
+
+        fn start_request(request_raw: []u8, header_pool: *header_t, request_pool: *request_pool_t) !init_request_t {
+            const request = try request_pool.create();
+            request.* = try Request.init(header_pool);
+            try request.*.parseRequest(request_raw);
+
+            return init_request_t{ .request = request, .cleanup = struct {
+                fn clean(inner_request: *Request, inner_header_pool: *header_t, inner_request_pool: *request_pool_t) !void {
+                    try inner_request.*.deinit(inner_header_pool);
+                    inner_request_pool.destroy(inner_request);
+                }
+            }.clean };
+        }
+
+        fn start_response(header_pool: *header_t, response_pool: *response_pool_t) !init_response_t {
+            const response = try response_pool.create();
+            response.* = try Response.init(header_pool);
+            return init_response_t{ .response = response, .cleanup = struct {
+                fn clean(inner_response: *Response, inner_header_pool: *header_t, inner_response_pool: *response_pool_t) !void {
+                    try inner_response.*.deinit(inner_header_pool);
+                    inner_response_pool.destroy(inner_response);
+                }
+            }.clean };
         }
 
         fn on_close(handle: [*c]uv.uv_handle_t) callconv(.C) void {
