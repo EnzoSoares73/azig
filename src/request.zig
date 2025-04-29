@@ -10,7 +10,6 @@ pub const Request = struct {
     version: []const u8,
     headers: StringHashMap([]const u8),
     body: ?[]const u8,
-    is_init: bool = false,
 
     const Self = @This();
 
@@ -23,23 +22,12 @@ pub const Request = struct {
             .method = undefined,
             .path = undefined,
             .version = undefined,
-            .is_init = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
         self.* = undefined;
-        self.*.is_init = false;
-    }
-
-    pub fn reset(self: *Self) void {
-        self.*.body = null;
-        self.*.method = undefined;
-        self.*.path = undefined;
-        self.*.version = undefined;
-        self.*.headers.clearRetainingCapacity();
-        self.*.is_init = true;
     }
 
     pub fn printSelf(self: Self) void {

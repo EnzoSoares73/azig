@@ -75,18 +75,16 @@ pub fn libuv(comptime AppContext: type) type {
                     print("Failed to allocate request\n", .{});
                     return;
                 };
-                if (!request.*.is_init) {
-                    request.* = Request.init(allocator) catch {
-                        print("Failed to init request\n", .{});
-                        return;
-                    };
-                }
+                request.* = Request.init(allocator) catch {
+                    print("Failed to init request\n", .{});
+                    return;
+                };
                 request.*.parseRequest(request_raw) catch {
                     print("Failed to parse request\n", .{});
                     return;
                 };
                 defer {
-                    request.*.reset();
+                    request.*.deinit();
                     request_pool.destroy(request);
                 }
 
@@ -94,14 +92,12 @@ pub fn libuv(comptime AppContext: type) type {
                     print("Failed to allocate response\n", .{});
                     return;
                 };
-                if (!response.*.is_init) {
-                    response.* = Response.init(allocator) catch {
-                        print("Failed to create response\n", .{});
-                        return;
-                    };
-                }
+                response.* = Response.init(allocator) catch {
+                    print("Failed to create response\n", .{});
+                    return;
+                };
                 defer {
-                    response.*.reset();
+                    response.*.deinit();
                     response_pool.destroy(response);
                 }
 

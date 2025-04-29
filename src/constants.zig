@@ -4,7 +4,7 @@ const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const uv = @import("imports/libuv.zig");
 const Context = @import("context.zig").Context;
-const ThreadSafeMemoryPool = @import("thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
+const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 
 pub const DEFAULT_PORT: u16 = 2500;
 

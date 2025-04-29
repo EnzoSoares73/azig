@@ -12,7 +12,6 @@ pub const Response = struct {
     status_code: u16,
     headers: StringHashMap([]const u8),
     body: ?[]const u8,
-    is_init: bool = false,
 
     const Self = @This();
 
@@ -23,20 +22,12 @@ pub const Response = struct {
             .body = null,
             .headers = map,
             .status_code = 200,
-            .is_init = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
         self.* = undefined;
-    }
-
-    pub fn reset(self: *Self) void {
-        self.*.body = null;
-        self.*.status_code = 200;
-        self.*.headers.clearRetainingCapacity();
-        self.*.is_init = true;
     }
 
     pub fn addHeader(self: *Self, name: []u8, value: []u8) !void {
