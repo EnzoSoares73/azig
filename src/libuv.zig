@@ -130,24 +130,27 @@ pub fn libuv(comptime AppContext: type) type {
                     return;
                 };
 
-                const connection_header = request.*.getHeader(@constCast("Connection"));
-                var is_keep_alive: bool = true;
-
-                if (connection_header) |header| {
-                    if (!std.ascii.eqlIgnoreCase(header, "keep-alive")) {
-                        is_keep_alive = false;
-                    }
-                }
-
                 var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
                 _ = uv.uv_write(
                     write_req,
                     stream,
                     &buf_resp,
                     1,
-                    if (is_keep_alive) on_write_complete_keep_alive else on_write_complete_no_keep_alive,
+                    if (is_keep_alive(request.*)) on_write_complete_keep_alive else on_write_complete_no_keep_alive,
                 );
             }
+        }
+
+        fn is_keep_alive(request: Request) bool {
+            const connection_header = request.getHeader(@constCast("Connection"));
+
+            if (connection_header) |header| {
+                if (!std.ascii.eqlIgnoreCase(header, "keep-alive")) {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {

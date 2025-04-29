@@ -6,8 +6,8 @@ works on the latest version of Zig.
 ## Table of Contents
 
 * [Installation](#installation)
-* [Basic use](#Basic use)
-* [Global Context](#Global Context)
+* [Basic use](#basic-use)
+* [Global Context](#global-context)
 
 ### Instalation
 
