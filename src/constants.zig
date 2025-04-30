@@ -49,3 +49,5 @@ pub const write_req_pool_t = ThreadSafeMemoryPool(uv.uv_write_t, .{
 pub const header_t = HeaderPool(.{
     .growable = true,
 });
+
+pub const supported_versions = [_][]const u8{ "HTTP/1.1" };

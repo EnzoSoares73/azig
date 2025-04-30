@@ -1,7 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
 const print = std.debug.print;
-const request_lib = @import("request.zig");
 const uv = @import("imports/libuv.zig");
 const Config = @import("config.zig").Config;
 const Request = @import("request.zig").Request;
@@ -130,7 +129,7 @@ pub fn libuv(comptime AppContext: type) type {
         }
 
         fn is_keep_alive(request: *Request) bool {
-            const connection_header = request.*.getHeader(@constCast("Connection"));
+            const connection_header = request.*.getHeader("Connection");
 
             if (connection_header) |header| {
                 if (!std.ascii.eqlIgnoreCase(header, "keep-alive")) {
