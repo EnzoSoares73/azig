@@ -2,8 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const Baton = @import("baton.zig").Baton;
 const uv = @import("imports/libuv.zig");
-const Context = @import("context.zig").Context;
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 const HeaderPool = @import("pools/header_pool.zig").HeaderPool;
 
@@ -38,7 +38,7 @@ pub const client_pool_t = ThreadSafeMemoryPool(uv.uv_tcp_t, .{
     .growable = true,
 });
 
-pub const context_pool_t = ThreadSafeMemoryPool(Context, .{
+pub const baton_pool_t = ThreadSafeMemoryPool(Baton, .{
     .growable = true,
 });
 

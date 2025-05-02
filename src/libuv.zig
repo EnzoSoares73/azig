@@ -6,21 +6,33 @@ const uv = @import("imports/libuv.zig");
 const Config = @import("config.zig").Config;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const Baton = @import("baton.zig").Baton;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
 const actual_buffer_size = @import("constants.zig").actual_buffer_size;
-const context_t = @import("context.zig").context_t;
 const callback_t = @import("constants.zig").callback_t;
 const thread_callback_t = @import("constants.zig").thread_callback_t;
 const buffer_pool_t = @import("constants.zig").buffer_pool_t;
 const request_pool_t = @import("constants.zig").request_pool_t;
 const response_pool_t = @import("constants.zig").response_pool_t;
 const client_pool_t = @import("constants.zig").client_pool_t;
-const context_pool_t = @import("constants.zig").context_pool_t;
+const baton_pool_t = @import("constants.zig").baton_pool_t;
+const work_pool_t = @import("constants.zig").work_pool_t;
 const write_req_pool_t = @import("constants.zig").write_req_pool_t;
 const header_t = @import("constants.zig").header_t;
 
 pub fn libuv(comptime AppContext: type) type {
-    const Context = context_t(AppContext);
+    const Context = struct {
+        allocator: *std.mem.Allocator,
+        callback: callback_t(AppContext),
+        buffer_allocator: *buffer_pool_t,
+        request_allocator: *request_pool_t,
+        response_allocator: *response_pool_t,
+        client_allocator: *client_pool_t,
+        write_req_allocator: *write_req_pool_t,
+        baton_allocator: *baton_pool_t,
+        header_allocator: *header_t,
+        app_context: *AppContext
+    };
 
     const init_request_t = struct { request: *Request, cleanup: *const fn (*Request, *header_t, *request_pool_t) anyerror!void };
 
@@ -49,16 +61,105 @@ pub fn libuv(comptime AppContext: type) type {
             }
         }
 
+        fn after_process(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
+            const baton: *Baton = @ptrCast(@alignCast(req.*.data));
+            const stream = baton.*.stream;
+            const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
+
+            if (status < 0) {
+                print("Operation cancelled\n", .{});
+                return;
+            }
+
+            const allocator = ctx.*.allocator.*;
+            var write_req_pool = ctx.*.write_req_allocator;
+            const response_pool = ctx.*.response_allocator;
+            const header_pool = ctx.*.header_allocator;
+            const baton_pool = ctx.*.baton_allocator;
+
+            const response = baton.*.response;
+            const on_write_cb = baton.*.on_write_cb;
+            const cleanup_response_cb = baton.*.cleanup_response_cb;
+            const buf = baton.*.buf;
+
+            defer {
+                cleanup_response_cb(response, header_pool, response_pool) catch {
+                    print("Failed to deinit response\n", .{});
+                };
+                baton_pool.destroy(baton);
+                allocator.free(buf);
+            }
+
+            const response_text = response.*.to_string(allocator) catch {
+                print("Failed to write response\n", .{});
+                return;
+            };
+            if (response_text.in_heap) {
+                defer allocator.free(response_text.string);
+            }
+
+            const write_req = write_req_pool.create() catch {
+                print("Failed to allocate write_req\n", .{});
+                return;
+            };
+
+            var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
+            _ = uv.uv_write(
+                write_req,
+                stream,
+                &buf_resp,
+                1,
+                on_write_cb,
+            );
+        }
+
+        fn process(req: [*c]uv.uv_work_t) callconv(.c) void {
+            const baton: *Baton = @ptrCast(@alignCast(req.*.data));
+            const stream = baton.*.stream;
+            const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
+
+            const request_pool = ctx.*.request_allocator;
+            const response_pool = ctx.*.response_allocator;
+            const header_pool = ctx.*.header_allocator;
+            const app_context = ctx.*.app_context;
+
+            const allocator = ctx.*.allocator.*;
+            const request_raw = baton.*.buf;
+
+            const request_struct = start_request(request_raw, header_pool, request_pool) catch {
+                print("There was an error initializing the request\n", .{});
+                return;
+            };
+            const request = request_struct.request;
+            defer request_struct.cleanup(request, header_pool, request_pool) catch {
+                print("Failed to deinit request\n", .{});
+            };
+
+            const response_struct = start_response(header_pool, response_pool) catch {
+                print("There was an error initializing the response\n", .{});
+                return;
+            };
+            const response = response_struct.response;
+
+            if (AppContext == void) {
+                ctx.*.callback(allocator, request, response) catch {
+                    return;
+                };
+            } else {
+                ctx.*.callback(allocator, app_context, request, response) catch {
+                    return;
+                };
+            }
+            baton.*.response = response;
+            baton.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
+            baton.*.cleanup_response_cb = response_struct.cleanup;
+        }
+
         fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
             const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
-            const main_allocator = ctx.*.allocator;
-            var buffer_pool = ctx.*.buffer_allocator;
-            const request_pool = ctx.*.request_allocator;
-            const response_pool = ctx.*.response_allocator;
-            var write_req_pool = ctx.*.write_req_allocator;
-            const header_pool = ctx.*.header_allocator;
-            const app_context = ctx.*.app_context;
+            const baton_pool = ctx.*.baton_allocator;
+            const buffer_pool = ctx.*.buffer_allocator;
 
             defer {
                 if (buf.*.base != null) {
@@ -66,66 +167,32 @@ pub fn libuv(comptime AppContext: type) type {
                 }
             }
 
-            if (nread < 0) {
+            if (nread < 0 or buf.*.base == null) {
                 if (nread != uv.UV_EOF) {
                     print("Read error: {s}\n", .{uv.uv_strerror(@intCast(nread))});
                 }
-                _ = uv.uv_close(@ptrCast(@alignCast(client)), on_close);
+                _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
             }
 
             if (nread > 0) {
-                const allocator = main_allocator.*;
-                const request_raw = buf.*.base[0..@intCast(nread)];
-
-                const request_struct = start_request(request_raw, header_pool, request_pool) catch {
-                    print("There was an error initializing the request", .{});
+                const baton = baton_pool.create() catch {
+                    print("Failed to allocate baton\n", .{});
                     return;
                 };
-                const request = request_struct.request;
-                defer request_struct.cleanup(request, header_pool, request_pool) catch {
-                    print("Failed to deinit request\n", .{});
-                };
-
-                const response_struct = start_response(header_pool, response_pool) catch {
-                    print("There was an error initializing the response", .{});
+                const request_raw = ctx.*.allocator.*.dupe(u8, buf.*.base[0..@intCast(nread)]) catch {
+                    baton_pool.destroy(baton);
+                    std.debug.print("Failed to copy request data\n", .{});
                     return;
                 };
-                const response = response_struct.response;
-                defer response_struct.cleanup(response, header_pool, response_pool) catch {
-                    print("Failed to deinit response\n", .{});
-                };
 
-                if (AppContext == void) {
-                    ctx.*.callback(allocator, request, response) catch {
-                        return;
-                    };
-                } else {
-                    ctx.*.callback(allocator, app_context, request, response) catch {
-                        return;
-                    };
+                baton.*.req.data = @ptrCast(@alignCast(baton));
+                baton.*.stream = stream;
+                baton.*.buf = request_raw;
+
+                const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), process, after_process);
+                if (res != 0) {
+                    _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
                 }
-
-                const response_text = response.to_string(allocator) catch {
-                    print("Failed to write response\n", .{});
-                    return;
-                };
-                if (response_text.in_heap) {
-                    defer allocator.free(response_text.string);
-                }
-
-                const write_req = write_req_pool.create() catch {
-                    print("Failed to allocate write_req\n", .{});
-                    return;
-                };
-
-                var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
-                _ = uv.uv_write(
-                    write_req,
-                    stream,
-                    &buf_resp,
-                    1,
-                    if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive,
-                );
             }
         }
 
@@ -223,6 +290,9 @@ pub fn libuv(comptime AppContext: type) type {
             ctx.*.write_req_allocator = try allocator.create(write_req_pool_t);
             ctx.*.write_req_allocator.* = try write_req_pool_t.initPreheated(allocator, pool_size);
 
+            ctx.*.baton_allocator = try allocator.create(baton_pool_t);
+            ctx.*.baton_allocator.* = try baton_pool_t.initPreheated(allocator, pool_size);
+
             ctx.*.header_allocator = try allocator.create(header_t);
             ctx.*.header_allocator.* = try header_t.initPreheated(allocator, pool_size * 2);
 
@@ -242,6 +312,9 @@ pub fn libuv(comptime AppContext: type) type {
 
                     ctx_inner.*.write_req_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.write_req_allocator);
+
+                    ctx_inner.*.baton_allocator.deinit();
+                    allocator_inner.destroy(ctx_inner.*.baton_allocator);
 
                     ctx_inner.*.header_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.header_allocator);
