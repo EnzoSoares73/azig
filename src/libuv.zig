@@ -35,7 +35,7 @@ pub fn libuv(comptime AppContext: type) type {
 
     const init_request_t = struct { request: *Request, cleanup: *const fn (*Request, *header_t, *request_pool_t) anyerror!void };
 
-    const init_response_t = struct { response: *Response, cleanup: *const fn (*Response, *header_t, *response_pool_t) anyerror!void };
+    const init_response_t = struct { arena: std.heap.ArenaAllocator, response: *Response, cleanup: *const fn (*Response, *header_t, *response_pool_t) anyerror!void };
 
     return struct {
         fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
@@ -79,14 +79,14 @@ pub fn libuv(comptime AppContext: type) type {
             const response = baton.*.response;
             const on_write_cb = baton.*.on_write_cb;
             const cleanup_response_cb = baton.*.cleanup_response_cb;
-            const buf = baton.*.buf;
+            const request_raw = baton.*.request_raw;
 
             defer {
                 cleanup_response_cb(response, header_pool, response_pool) catch {
                     print("Failed to deinit response\n", .{});
                 };
                 baton_pool.destroy(baton);
-                allocator.free(buf);
+                allocator.free(request_raw);
             }
 
             const response_text = response.*.to_string(allocator) catch {
@@ -123,7 +123,9 @@ pub fn libuv(comptime AppContext: type) type {
             const app_context = ctx.*.app_context;
 
             const allocator = ctx.*.allocator.*;
-            const request_raw = baton.*.buf;
+            const request_raw = baton.*.request_raw;
+
+            const arena = std.heap.ArenaAllocator.init(allocator);
 
             const request_struct = start_request(request_raw, header_pool, request_pool) catch {
                 print("There was an error initializing the request\n", .{});
@@ -134,18 +136,18 @@ pub fn libuv(comptime AppContext: type) type {
                 print("Failed to deinit request\n", .{});
             };
 
-            const response_struct = start_response(header_pool, response_pool) catch {
+            const response_struct = start_response(arena, header_pool, response_pool) catch {
                 print("There was an error initializing the response\n", .{});
                 return;
             };
             const response = response_struct.response;
 
             if (AppContext == void) {
-                ctx.*.callback(allocator, request, response) catch {
+                ctx.*.callback(request, response) catch {
                     return;
                 };
             } else {
-                ctx.*.callback(allocator, app_context, request, response) catch {
+                ctx.*.callback(app_context, request, response) catch {
                     return;
                 };
             }
@@ -186,7 +188,7 @@ pub fn libuv(comptime AppContext: type) type {
 
                 baton.*.req.data = @ptrCast(@alignCast(baton));
                 baton.*.stream = stream;
-                baton.*.buf = request_raw;
+                baton.*.request_raw = request_raw;
 
                 const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), process, after_process);
                 if (res != 0) {
@@ -242,13 +244,14 @@ pub fn libuv(comptime AppContext: type) type {
             }.clean };
         }
 
-        fn start_response(header_pool: *header_t, response_pool: *response_pool_t) !init_response_t {
+        fn start_response(arena: std.heap.ArenaAllocator, header_pool: *header_t, response_pool: *response_pool_t) !init_response_t {
             const response = try response_pool.create();
-            response.* = try Response.init(header_pool);
-            return init_response_t{ .response = response, .cleanup = struct {
+            response.* = try Response.init(arena, header_pool);
+            return init_response_t{ .arena = arena, .response = response, .cleanup = struct {
                 fn clean(inner_response: *Response, inner_header_pool: *header_t, inner_response_pool: *response_pool_t) !void {
                     try inner_response.*.deinit(inner_header_pool);
                     inner_response_pool.destroy(inner_response);
+                    inner_response.arena.deinit();
                 }
             }.clean };
         }

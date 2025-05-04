@@ -1,5 +1,4 @@
 const std = @import("std");
-const mem = std.mem;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
@@ -12,9 +11,9 @@ pub const DEFAULT_POOL_SIZE: u16 = 1024;
 
 pub fn callback_t(comptime AppContext: type) type {
     if (AppContext == void) {
-        return *const fn (mem.Allocator, *Request, *Response) anyerror!void;
+        return *const fn (*Request, *Response) anyerror!void;
     }
-    return *const fn (mem.Allocator, *AppContext, *Request, *Response) anyerror!void;
+    return *const fn (*AppContext, *Request, *Response) anyerror!void;
 }
 
 pub const thread_callback_t = ?*const fn (?*anyopaque) callconv(.C) void;

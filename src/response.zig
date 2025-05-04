@@ -14,15 +14,17 @@ pub const Response = struct {
     status_code: u16,
     headers: *StringHashMap([]const u8),
     body: ?[]const u8,
+    arena: std.heap.ArenaAllocator,
 
     const Self = @This();
 
-    pub fn init(header_pool: *header_t) !Self {
+    pub fn init(arena: std.heap.ArenaAllocator, header_pool: *header_t) !Self {
         const map = try header_pool.*.create();
         return Self{
             .body = null,
             .headers = map,
             .status_code = 200,
+            .arena = arena
         };
     }
 
