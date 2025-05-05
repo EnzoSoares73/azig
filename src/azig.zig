@@ -4,7 +4,7 @@ const uv = @import("imports/libuv.zig");
 const testing = std.testing;
 
 pub const Server = @import("server.zig").Server;
-pub const Request = @import("request.zig").Request;
+pub const request_t = @import("request.zig").request_t;
 pub const Response = @import("response.zig").Response;
 pub const Config = @import("config.zig").Config;
 

@@ -3,7 +3,7 @@ const mem = std.mem;
 const print = std.debug.print;
 const uv = @import("imports/libuv.zig");
 const Config = @import("config.zig").Config;
-const Request = @import("request.zig").Request;
+const request_t = @import("request.zig").request_t;
 const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
@@ -11,18 +11,24 @@ const actual_buffer_size = @import("constants.zig").actual_buffer_size;
 const callback_t = @import("constants.zig").callback_t;
 const thread_callback_t = @import("constants.zig").thread_callback_t;
 const buffer_pool_t = @import("constants.zig").buffer_pool_t;
-const request_pool_t = @import("constants.zig").request_pool_t;
 const response_pool_t = @import("constants.zig").response_pool_t;
 const client_pool_t = @import("constants.zig").client_pool_t;
 const baton_pool_t = @import("constants.zig").baton_pool_t;
 const work_pool_t = @import("constants.zig").work_pool_t;
 const write_req_pool_t = @import("constants.zig").write_req_pool_t;
 const header_t = @import("constants.zig").header_t;
+const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 
-pub fn libuv(comptime AppContext: type) type {
+pub fn libuv(comptime AppContext: type, comptime RequestContext: type) type {
+    const Request = request_t(RequestContext);
+
+    const request_pool_t = ThreadSafeMemoryPool(Request, .{
+        .growable = true,
+    });
+
     const Context = struct {
         allocator: *std.mem.Allocator,
-        callback: callback_t(AppContext),
+        callback: callback_t(AppContext, RequestContext),
         buffer_allocator: *buffer_pool_t,
         request_allocator: *request_pool_t,
         response_allocator: *response_pool_t,
@@ -324,7 +330,7 @@ pub fn libuv(comptime AppContext: type) type {
             }.clean;
         }
 
-        pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_t(AppContext), app_context: *AppContext) !void {
+        pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_t(AppContext, RequestContext), app_context: *AppContext) !void {
             const ctx: *Context = try allocator.*.create(Context);
             ctx.*.allocator = allocator;
             ctx.*.callback = callback;

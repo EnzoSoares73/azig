@@ -140,7 +140,7 @@ test "Response initialization and cleanup" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
 
     try testing.expectEqual(@as(u16, 200), response.status_code);
     try testing.expectEqual(@as(?[]const u8, null), response.body);
@@ -156,7 +156,7 @@ test "Response addHeader" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
 
     try response.addHeader("Content-Type", "application/json");
     try response.addHeader("X-Custom-Header", "test-value");
@@ -175,7 +175,7 @@ test "Response to_string with small response" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
 
     try response.addHeader("Content-Type", "text/plain");
     response.body = "Hello, World!";
@@ -199,7 +199,7 @@ test "Response to_string with large response" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
 
     const body_size = 5000;
     const large_body = try allocator.alloc(u8, body_size);
@@ -225,7 +225,7 @@ test "Response status code strings" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
 
     // Test known status codes
     response.status_code = 200;
@@ -254,7 +254,7 @@ test "Response with no body" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
     try response.addHeader("X-Empty", "true");
     response.body = null;
 
@@ -276,7 +276,7 @@ test "Response calculate_serialized_size" {
 
     var header_pool = header_t.init(allocator);
 
-    var response = try Response.init(&header_pool);
+    var response = try Response.init(arena, &header_pool);
 
     try response.addHeader("Content-Type", "text/html");
     response.body = "<html></html>";

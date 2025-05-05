@@ -1,15 +1,16 @@
 const std = @import("std");
-const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
 const uv = @import("imports/libuv.zig");
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 const HeaderPool = @import("pools/header_pool.zig").HeaderPool;
+const request_t = @import("request.zig").request_t;
 
 pub const DEFAULT_PORT: u16 = 2500;
 pub const DEFAULT_POOL_SIZE: u16 = 1024;
 
-pub fn callback_t(comptime AppContext: type) type {
+pub fn callback_t(comptime AppContext: type, comptime RequestContext: type) type {
+    const Request = request_t(RequestContext);
     if (AppContext == void) {
         return *const fn (*Request, *Response) anyerror!void;
     }
@@ -22,10 +23,6 @@ pub const suggested_buffer_size: usize = 65536;
 pub const actual_buffer_size = suggested_buffer_size + @sizeOf(usize);
 
 pub const buffer_pool_t = ThreadSafeMemoryPool([suggested_buffer_size]u8, .{
-    .growable = true,
-});
-
-pub const request_pool_t = ThreadSafeMemoryPool(Request, .{
     .growable = true,
 });
 
