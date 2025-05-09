@@ -14,9 +14,7 @@ pub fn request_t(comptime RequestContext: type) type {
         version: []const u8,
         headers: *StringHashMap([]const u8),
         body: ?[]const u8,
-        usingnamespace if (RequestContext != void) struct {
-            context: RequestContext,
-        } else struct {};
+        context: RequestContext,
 
         const Self = @This();
 
@@ -28,6 +26,7 @@ pub fn request_t(comptime RequestContext: type) type {
                 .method = undefined,
                 .path = undefined,
                 .version = undefined,
+                .context = undefined,
             };
         }
 

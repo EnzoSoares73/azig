@@ -31,25 +31,28 @@ exe.root_module.addImport("azig", azig);
 
 ```zig
 const std = @import("std");
-const azig = @import("azig");
+const azig = @import("azig.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     var allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    const server = azig.Server(void).init(&allocator, azig.Config{}, on_response, undefined);
+    const server = azig.Server(void, void).init(&allocator, azig.Config{}, on_response, {});
     try server.start();
 }
 
-fn on_response(_: std.mem.Allocator, _: *void, _: *azig.Request, _: *azig.Response) !void {}
+fn on_response(_: *azig.Request, _: *azig.Response) !void {
+}
 ```
 
 ### Global Context
 
+In case you want to pass data to all the requests, you can use the global AppContext.
+
 ```zig
 const std = @import("std");
-const azig = @import("azig");
+const azig = @import("azig.zig");
 
 const AppContext = struct {
   db_connection: u16,
@@ -64,35 +67,45 @@ pub fn main() !void {
     app_context.*.db_connection = 123;
     defer allocator.destroy(app_context);
 
-    const server = azig.Server(AppContext).init(&allocator, azig.Config{}, on_response, app_context);
+    const server = azig.Server(AppContext, void).init(&allocator, azig.Config{}, on_response, app_context);
     try server.start();
 }
 
-fn on_response(_: std.mem.Allocator, _: *AppContext, _: *azig.Request, _: *azig.Response) !void {}
+fn on_response(_: *AppContext, _: *azig.Request, _: *azig.Response) !void {}
 ```
 
-### Asynchronous tasks
+### Request Context
+
+For data that is only meant to be accessed by a single request, use the RequestContext. The data herer will be set by middleware.
 
 ```zig
 const std = @import("std");
-const azig = @import("azig");
+const azig = @import("azig.zig");
+
+const AppContext = struct {
+  db_connection: u16,
+};
+
+const RequestContext = struct {
+    user: []u8
+};
+
+const Request = azig.request_t(RequestContext);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     var allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    const server = azig.Server(void).init(&allocator, azig.Config{}, on_response, undefined);
+    const app_context = try allocator.create(AppContext);
+    app_context.*.db_connection = 123;
+    defer allocator.destroy(app_context);
+
+    const server = azig.Server(AppContext, RequestContext).init(&allocator, azig.Config{}, on_response, app_context);
     try server.start();
 }
 
-fn on_response(_: std.mem.Allocator, _: *void, _: *azig.Request, _: *azig.Response) !void {
-    azig.act_blocking(cb, null);
-    azig.act_non_blocking(cb, null);
-}
-
-fn cb(_: ?*anyopaque) callconv(.C) void {
-    std.time.sleep( * std.time.ns_per_s);
-    std.debug.print("{d}\n", .{1});
+fn on_response(_: *AppContext, request: *Request, _: *azig.Response) !void {
+    _ = request.context;
 }
 ```

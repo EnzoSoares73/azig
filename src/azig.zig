@@ -5,6 +5,7 @@ const testing = std.testing;
 
 pub const Server = @import("server.zig").Server;
 pub const request_t = @import("request.zig").request_t;
+pub const Request = @import("request.zig").request_t(void);
 pub const Response = @import("response.zig").Response;
 pub const Config = @import("config.zig").Config;
 
