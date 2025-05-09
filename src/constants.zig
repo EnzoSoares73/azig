@@ -9,14 +9,6 @@ const request_t = @import("request.zig").request_t;
 pub const DEFAULT_PORT: u16 = 2500;
 pub const DEFAULT_POOL_SIZE: u16 = 1024;
 
-pub fn callback_t(comptime AppContext: type, comptime RequestContext: type) type {
-    const Request = request_t(RequestContext);
-    if (AppContext == void) {
-        return *const fn (*Request, *Response) anyerror!void;
-    }
-    return *const fn (*AppContext, *Request, *Response) anyerror!void;
-}
-
 pub const thread_callback_t = ?*const fn (?*anyopaque) callconv(.C) void;
 
 pub const suggested_buffer_size: usize = 65536;

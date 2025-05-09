@@ -8,7 +8,6 @@ const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
 const actual_buffer_size = @import("constants.zig").actual_buffer_size;
-const callback_t = @import("constants.zig").callback_t;
 const thread_callback_t = @import("constants.zig").thread_callback_t;
 const buffer_pool_t = @import("constants.zig").buffer_pool_t;
 const response_pool_t = @import("constants.zig").response_pool_t;
@@ -22,13 +21,18 @@ const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").Thread
 pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = request_t(RequestContext);
 
+    const callback_t = if (AppContext == void)
+            *const fn (*Request, *Response) anyerror!void
+        else
+            *const fn (*AppContext, *Request, *Response) anyerror!void;
+
     const request_pool_t = ThreadSafeMemoryPool(Request, .{
         .growable = true,
     });
 
     const Context = struct {
         allocator: *std.mem.Allocator,
-        callback: callback_t(AppContext, RequestContext),
+        callback: callback_t,
         buffer_allocator: *buffer_pool_t,
         request_allocator: *request_pool_t,
         response_allocator: *response_pool_t,
@@ -46,12 +50,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     return struct {
         allocator: *mem.Allocator,
         config: Config = .{},
-        callback: callback_t(AppContext, RequestContext),
+        callback: callback_t,
         app_context: if (AppContext == void) void else *AppContext,
 
         const Self = @This();
 
-        pub fn init(allocator: *mem.Allocator, comptime config: Config, callback: callback_t(AppContext, RequestContext), app_context: if (AppContext == void) void else *AppContext) Self {
+        pub fn init(allocator: *mem.Allocator, comptime config: Config, callback: callback_t, app_context: if (AppContext == void) void else *AppContext) Self {
             return Self{
                 .allocator = allocator,
                 .config = config,
@@ -350,7 +354,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean;
         }
 
-        pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_t(AppContext, RequestContext), app_context: *AppContext) !void {
+        pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_t, app_context: *AppContext) !void {
             const ctx: *Context = try allocator.*.create(Context);
             ctx.*.allocator = allocator;
             ctx.*.callback = callback;
