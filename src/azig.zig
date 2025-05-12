@@ -1,12 +1,17 @@
 const std = @import("std");
 const testing = std.testing;
+pub const server_t = @import("server.zig").Server;
+pub const request_t = @import("request.zig").request_t;
+pub const response_t = @import("response.zig").Response;
+pub const config_t = @import("config.zig").Config;
+pub const action_t = @import("action.zig");
 
 pub fn Azig(comptime AppContext: type, comptime RequestContext: type) type {
     return struct {
-        pub const Server = @import("server.zig").Server(AppContext, RequestContext);
+        pub const Server = server_t(AppContext, RequestContext);
         pub const Request = @import("request.zig").request_t(RequestContext);
-        pub const Response = @import("response.zig").Response;
-        pub const Config = @import("config.zig").Config;
+        pub const Response = response_t;
+        pub const Config = config_t;
         pub const Action = @import("action.zig").action_t(AppContext, RequestContext);
     };
 }
