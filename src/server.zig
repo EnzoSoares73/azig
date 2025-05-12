@@ -209,7 +209,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .callback = ctx.*.callback,
             };
             action.next() catch {
-
+                response.*.set_error_response();
             };
         }
 

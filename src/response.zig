@@ -118,6 +118,12 @@ pub const Response = struct {
         return buffer[0..stream.pos];
     }
 
+    fn set_error_response(self: *Self) void {
+        self.*.headers.clearRetainingCapacity();
+        self.*.body = null;
+        self.*.status_code = 500;
+    }
+
     fn statusCodeToString(code: u16) ?[]const u8 {
         return switch (code) {
             200 => "OK",
