@@ -6,6 +6,7 @@ const Config = @import("config.zig").Config;
 const request_t = @import("request.zig").request_t;
 const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
+const action_t = @import("action.zig").action_t;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
 const actual_buffer_size = @import("constants.zig").actual_buffer_size;
 const callback_t = @import("constants.zig").callback_t;
@@ -16,6 +17,8 @@ const client_pool_t = @import("constants.zig").client_pool_t;
 const baton_pool_t = @import("constants.zig").baton_pool_t;
 const work_pool_t = @import("constants.zig").work_pool_t;
 const write_req_pool_t = @import("constants.zig").write_req_pool_t;
+const arena_pool_t = @import("constants.zig").arena_pool_t;
+const middleware_t = @import("constants.zig").middleware_t;
 const header_t = @import("constants.zig").header_t;
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 
@@ -23,6 +26,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = request_t(RequestContext);
 
     const callback_fn = callback_t(AppContext, RequestContext);
+
+    const Action = action_t(AppContext, RequestContext);
+
+    const middleware = middleware_t(AppContext, RequestContext);
 
     const request_pool_t = ThreadSafeMemoryPool(Request, .{
         .growable = true,
@@ -37,19 +44,22 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         client_allocator: *client_pool_t,
         write_req_allocator: *write_req_pool_t,
         baton_allocator: *baton_pool_t,
+        arena_allocator: *arena_pool_t,
         header_allocator: *header_t,
-        app_context: *AppContext
+        app_context: *AppContext,
+        middleware_list: []const middleware,
     };
 
     const init_request_t = struct { request: *Request, cleanup: *const fn (*Request, *header_t, *request_pool_t) anyerror!void };
 
-    const init_response_t = struct { arena: std.heap.ArenaAllocator, response: *Response, cleanup: *const fn (*Response, *header_t, *response_pool_t) anyerror!void };
+    const init_response_t = struct { response: *Response, cleanup: *const fn (*Response, *header_t, *response_pool_t) anyerror!void };
 
     return struct {
         allocator: *mem.Allocator,
         config: Config = .{},
         callback: callback_fn,
         app_context: if (AppContext == void) void else *AppContext,
+        middleware_list: []const middleware,
 
         const Self = @This();
 
@@ -59,11 +69,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .config = config,
                 .callback = callback,
                 .app_context = app_context,
+                .middleware_list = &.{}
             };
         }
 
         pub fn start(self: Self) !void {
-            try libuv_execute(self.allocator, self.config, self.callback, if (AppContext == void) undefined else self.app_context);
+            try libuv_execute(self.allocator, self.config, self.callback, if (AppContext == void) undefined else self.app_context, self.middleware_list);
+        }
+
+        pub fn register_middleware(self: *Self, middleware_list: []const middleware) void {
+            self.middleware_list = middleware_list;
         }
 
         fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
@@ -103,6 +118,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const response_pool = ctx.*.response_allocator;
             const header_pool = ctx.*.header_allocator;
             const baton_pool = ctx.*.baton_allocator;
+            const arena_pool = ctx.*.arena_allocator;
 
             const response = baton.*.response;
             const on_write_cb = baton.*.on_write_cb;
@@ -110,9 +126,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const request_raw = baton.*.request_raw;
 
             defer {
+                const arena = response.*.arena;
                 cleanup_response_cb(response, header_pool, response_pool) catch {
                     print("Failed to deinit response\n", .{});
                 };
+                arena_pool.destroy(arena);
                 baton_pool.destroy(baton);
                 allocator.free(request_raw);
             }
@@ -148,12 +166,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const request_pool = ctx.*.request_allocator;
             const response_pool = ctx.*.response_allocator;
             const header_pool = ctx.*.header_allocator;
-            const app_context = ctx.*.app_context;
+            const arena_pool = ctx.*.arena_allocator;
 
             const allocator = ctx.*.allocator.*;
             const request_raw = baton.*.request_raw;
 
-            const arena = std.heap.ArenaAllocator.init(allocator);
+            const arena = arena_pool.create() catch {
+                print("There was an error initializing the arena\n", .{});
+                return;
+            };
+            arena.* = std.heap.ArenaAllocator.init(allocator);
 
             const request_struct = start_request(request_raw, header_pool, request_pool) catch {
                 print("There was an error initializing the request\n", .{});
@@ -170,18 +192,25 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             };
             const response = response_struct.response;
 
-            if (AppContext == void) {
-                ctx.*.callback(request, response) catch {
-                    return;
-                };
-            } else {
-                ctx.*.callback(app_context, request, response) catch {
-                    return;
-                };
-            }
+            handle_callback(ctx, request, response);
+
             baton.*.response = response;
             baton.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
             baton.*.cleanup_response_cb = response_struct.cleanup;
+        }
+
+        fn handle_callback(ctx: *Context, request: *Request, response: *Response) void {
+            const action: Action = .{
+                .app_context = ctx.*.app_context,
+                .index = 0,
+                .middleware_list = ctx.*.middleware_list,
+                .request = request,
+                .response = response,
+                .callback = ctx.*.callback,
+            };
+            action.next() catch {
+
+            };
         }
 
         fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
@@ -272,14 +301,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean };
         }
 
-        fn start_response(arena: std.heap.ArenaAllocator, header_pool: *header_t, response_pool: *response_pool_t) !init_response_t {
+        fn start_response(arena: *std.heap.ArenaAllocator, header_pool: *header_t, response_pool: *response_pool_t) !init_response_t {
             const response = try response_pool.create();
             response.* = try Response.init(arena, header_pool);
-            return init_response_t{ .arena = arena, .response = response, .cleanup = struct {
+            return init_response_t{ .response = response, .cleanup = struct {
                 fn clean(inner_response: *Response, inner_header_pool: *header_t, inner_response_pool: *response_pool_t) !void {
+                    inner_response.arena.*.deinit();
                     try inner_response.*.deinit(inner_header_pool);
                     inner_response_pool.destroy(inner_response);
-                    inner_response.arena.deinit();
                 }
             }.clean };
         }
@@ -323,6 +352,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.baton_allocator = try allocator.create(baton_pool_t);
             ctx.*.baton_allocator.* = try baton_pool_t.initPreheated(allocator, pool_size);
 
+            ctx.*.arena_allocator = try allocator.create(arena_pool_t);
+            ctx.*.arena_allocator.* = try arena_pool_t.initPreheated(allocator, pool_size);
+
             ctx.*.header_allocator = try allocator.create(header_t);
             ctx.*.header_allocator.* = try header_t.initPreheated(allocator, pool_size * 2);
 
@@ -346,17 +378,21 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx_inner.*.baton_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.baton_allocator);
 
+                    ctx_inner.*.arena_allocator.deinit();
+                    allocator_inner.destroy(ctx_inner.*.arena_allocator);
+
                     ctx_inner.*.header_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.header_allocator);
                 }
             }.clean;
         }
 
-        pub fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_fn, app_context: *AppContext) !void {
+        fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_fn, app_context: *AppContext, middleware_list: []const middleware) !void {
             const ctx: *Context = try allocator.*.create(Context);
             ctx.*.allocator = allocator;
             ctx.*.callback = callback;
             ctx.*.app_context = app_context;
+            ctx.*.middleware_list = middleware_list;
 
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);

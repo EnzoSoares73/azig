@@ -31,14 +31,14 @@ exe.root_module.addImport("azig", azig);
 
 ```zig
 const std = @import("std");
-const azig = @import("azig.zig");
+const azig = @import("azig.zig").Azig(void, void);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     var allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    const server = azig.Server(void, void).init(&allocator, azig.Config{}, on_response, {});
+    var server = azig.Server.init(&allocator, azig.Config{}, on_response, {});
     try server.start();
 }
 
@@ -52,7 +52,7 @@ In case you want to pass data to all the requests, you can use the global AppCon
 
 ```zig
 const std = @import("std");
-const azig = @import("azig.zig");
+const azig = @import("azig.zig").Azig(AppContext, void);
 
 const AppContext = struct {
   db_connection: u16,
@@ -67,7 +67,7 @@ pub fn main() !void {
     app_context.*.db_connection = 123;
     defer allocator.destroy(app_context);
 
-    const server = azig.Server(AppContext, void).init(&allocator, azig.Config{}, on_response, app_context);
+    const server = azig.Server.init(&allocator, azig.Config{}, on_response, app_context);
     try server.start();
 }
 
@@ -76,11 +76,11 @@ fn on_response(_: *AppContext, _: *azig.Request, _: *azig.Response) !void {}
 
 ### Request Context
 
-For data that is only meant to be accessed by a single request, use the RequestContext. The data herer will be set by middleware.
+For data that is only meant to be accessed by a single request, use the RequestContext. The data here will be set by middleware.
 
 ```zig
 const std = @import("std");
-const azig = @import("azig.zig");
+const azig = @import("azig.zig").Azig(AppContext, RequestContext);
 
 const AppContext = struct {
   db_connection: u16,
@@ -90,8 +90,6 @@ const RequestContext = struct {
     user: []u8
 };
 
-const Request = azig.request_t(RequestContext);
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     var allocator = gpa.allocator();
@@ -101,11 +99,48 @@ pub fn main() !void {
     app_context.*.db_connection = 123;
     defer allocator.destroy(app_context);
 
-    const server = azig.Server(AppContext, RequestContext).init(&allocator, azig.Config{}, on_response, app_context);
+    const server = azig.Server.init(&allocator, azig.Config{}, on_response, app_context);
     try server.start();
 }
 
-fn on_response(_: *AppContext, request: *Request, _: *azig.Response) !void {
+fn on_response(_: *AppContext, request: *azig.Request, _: *azig.Response) !void {
     _ = request.context;
 }
 ```
+
+### Middlewares
+
+To define a middleware, use the server.register_middleware function:
+
+```zig
+const std = @import("std");
+const azig = @import("azig.zig").Azig(void, void);
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = azig.Server.init(&allocator, azig.Config{}, on_response, {});
+    server.register_middleware(&.{middleware1, middleware2});
+    try server.start();
+}
+
+fn on_response(request: *azig.Request, _: *azig.Response) !void {
+    request.printSelf();
+}
+
+fn middleware1(_: *azig.Request, _: *azig.Response, action: azig.Action) !void {
+    std.debug.print("Mid 1 start\n", .{});
+    try action.next();
+    std.debug.print("Mid 1 end\n", .{});
+}
+
+fn middleware2(_: *azig.Request, _: *azig.Response, action: azig.Action) !void {
+    std.debug.print("Mid 2 start\n", .{});
+    try action.next();
+    std.debug.print("Mid 2 end\n", .{});
+}
+```
+
+The action.next() call simply calls the next middleware on the list or the on_response callback, in case there are none left.
