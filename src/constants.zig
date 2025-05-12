@@ -28,7 +28,6 @@ pub fn middleware_t(comptime AppContext: type, comptime RequestContext: type) ty
 }
 
 pub const suggested_buffer_size: usize = 65536;
-pub const actual_buffer_size = suggested_buffer_size + @sizeOf(usize);
 
 pub const buffer_pool_t = ThreadSafeMemoryPool([suggested_buffer_size]u8, .{
     .growable = true,

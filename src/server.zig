@@ -8,7 +8,6 @@ const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
 const action_t = @import("action.zig").action_t;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
-const actual_buffer_size = @import("constants.zig").actual_buffer_size;
 const callback_t = @import("constants.zig").callback_t;
 const thread_callback_t = @import("constants.zig").thread_callback_t;
 const buffer_pool_t = @import("constants.zig").buffer_pool_t;
