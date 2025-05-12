@@ -99,7 +99,7 @@ pub fn main() !void {
     app_context.*.db_connection = 123;
     defer allocator.destroy(app_context);
 
-    const server = azig.Server.init(&allocator, azig.Config{}, on_response, app_context);
+    var server = azig.Server.init(&allocator, azig.Config{}, on_response, app_context);
     try server.start();
 }
 

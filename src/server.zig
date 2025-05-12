@@ -59,6 +59,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         callback: callback_fn,
         app_context: if (AppContext == void) void else *AppContext,
         middleware_list: []const middleware,
+        loop: [*c]uv.uv_loop_t,
 
         const Self = @This();
 
@@ -68,12 +69,26 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .config = config,
                 .callback = callback,
                 .app_context = app_context,
-                .middleware_list = &.{}
+                .middleware_list = &.{},
+                .loop = undefined,
             };
         }
 
-        pub fn start(self: Self) !void {
-            try libuv_execute(self.allocator, self.config, self.callback, if (AppContext == void) undefined else self.app_context, self.middleware_list);
+        pub fn start(self: *Self) !void {
+            try self.libuv_execute(self.allocator, self.config, self.callback, if (AppContext == void) undefined else self.app_context, self.middleware_list);
+        }
+
+        pub fn stop(self: *Self) void {
+            print("Stopped server\n", .{});
+            uv.uv_stop(self.*.loop);
+
+            uv.uv_walk(self.*.loop, struct {
+                fn cb(handle: [*c]uv.uv_handle_t, _: ?*anyopaque) callconv(.c) void {
+                    uv.uv_close(handle, null);
+                }
+            }.cb, null);
+
+            _ = uv.uv_loop_close(self.loop);
         }
 
         pub fn register_middleware(self: *Self, middleware_list: []const middleware) void {
@@ -85,7 +100,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const client_pool = ctx.client_allocator;
 
             if (status < 0) {
-                print("New connection error {s}\n", .{uv.uv_strerror(status)});
                 return;
             }
 
@@ -284,6 +298,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (status < 0) {
                 print("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
+            uv.uv_stop(req.*.handle.*.loop);
             _ = uv.uv_close(@ptrCast(req.*.handle), on_close);
         }
 
@@ -386,8 +401,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean;
         }
 
-        fn libuv_execute(allocator: *mem.Allocator, config: Config, callback: callback_fn, app_context: *AppContext, middleware_list: []const middleware) !void {
+        fn libuv_execute(self: *Self, allocator: *mem.Allocator, config: Config, callback: callback_fn, app_context: *AppContext, middleware_list: []const middleware) !void {
             const ctx: *Context = try allocator.*.create(Context);
+            defer allocator.*.destroy(ctx);
             ctx.*.allocator = allocator;
             ctx.*.callback = callback;
             ctx.*.app_context = app_context;
@@ -399,6 +415,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             print("Started server\n", .{});
 
             const loop = uv.uv_default_loop();
+            self.loop = loop;
 
             var server: uv.uv_tcp_t = undefined;
             _ = uv.uv_tcp_init(loop, &server);
