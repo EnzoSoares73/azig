@@ -75,7 +75,37 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         pub fn start(self: *Self) !void {
-            try self.libuv_execute(self.allocator, self.config, self.callback, if (AppContext == void) undefined else self.app_context, self.middleware_list);
+            const allocator = self.allocator;
+            const config = self.config;
+            const callback = self.callback;
+            const app_context = if (AppContext == void) undefined else self.app_context;
+            const middleware_list = self.middleware_list;
+
+            const ctx: *Context = try allocator.*.create(Context);
+            defer allocator.*.destroy(ctx);
+            ctx.*.allocator = allocator;
+            ctx.*.callback = callback;
+            ctx.*.app_context = app_context;
+            ctx.*.middleware_list = middleware_list;
+
+            const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
+            defer cleanup(allocator.*, ctx);
+
+            const loop = uv.uv_default_loop();
+            self.loop = loop;
+
+            var server: uv.uv_tcp_t = undefined;
+            _ = uv.uv_tcp_init(loop, &server);
+            server.data = @constCast(ctx);
+            _ = uv.uv_tcp_nodelay(&server, @intCast(0));
+
+            var addr: uv.struct_sockaddr_in = undefined;
+            _ = uv.uv_ip4_addr("0.0.0.0", @intCast(config.port), &addr);
+            _ = uv.uv_tcp_bind(&server, @ptrCast(&addr), 0);
+
+            _ = uv.uv_listen(@ptrCast(&server), 128, on_connection);
+
+            _ = uv.uv_run(loop, uv.UV_RUN_DEFAULT);
         }
 
         pub fn stop(self: *Self) void {
@@ -398,34 +428,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     allocator_inner.destroy(ctx_inner.*.header_allocator);
                 }
             }.clean;
-        }
-
-        fn libuv_execute(self: *Self, allocator: *mem.Allocator, config: Config, callback: callback_fn, app_context: *AppContext, middleware_list: []const middleware) !void {
-            const ctx: *Context = try allocator.*.create(Context);
-            defer allocator.*.destroy(ctx);
-            ctx.*.allocator = allocator;
-            ctx.*.callback = callback;
-            ctx.*.app_context = app_context;
-            ctx.*.middleware_list = middleware_list;
-
-            const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
-            defer cleanup(allocator.*, ctx);
-
-            const loop = uv.uv_default_loop();
-            self.loop = loop;
-
-            var server: uv.uv_tcp_t = undefined;
-            _ = uv.uv_tcp_init(loop, &server);
-            server.data = @constCast(ctx);
-            _ = uv.uv_tcp_nodelay(&server, @intCast(0));
-
-            var addr: uv.struct_sockaddr_in = undefined;
-            _ = uv.uv_ip4_addr("0.0.0.0", @intCast(config.port), &addr);
-            _ = uv.uv_tcp_bind(&server, @ptrCast(&addr), 0);
-
-            _ = uv.uv_listen(@ptrCast(&server), 128, on_connection);
-
-            _ = uv.uv_run(loop, uv.UV_RUN_DEFAULT);
         }
     };
 }
