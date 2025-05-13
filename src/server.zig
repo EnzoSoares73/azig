@@ -434,3 +434,45 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
     };
 }
+
+const testing = std.testing;
+
+test "should start and stop" {
+    const azig = Server(void, void);
+    const Request = request_t(void);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const on_response = struct {
+            fn on_response(_: *Request, _: *Response) !void {
+        }
+    }.on_response;
+
+    var server = azig.init(&allocator, Config{}, on_response, {});
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(server_ptr: *azig) !void {
+            try server_ptr.start();
+        }
+    }.run, .{&server});
+
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    const uri = try std.Uri.parse("http://localhost:2500");
+
+    var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+    defer req.deinit();
+
+    try req.send();
+    try req.finish();
+    try req.wait();
+
+    try testing.expectEqual(req.response.status, std.http.Status.ok);
+    server.stop();
+    thread.join();
+}

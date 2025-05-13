@@ -51,6 +51,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    run_step.dependOn(&run_cmd.step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
