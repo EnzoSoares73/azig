@@ -15,7 +15,3 @@ pub fn Azig(comptime AppContext: type, comptime RequestContext: type) type {
         pub const Action = @import("action.zig").action_t(AppContext, RequestContext);
     };
 }
-
-test {
-    testing.refAllDecls(@This());
-}

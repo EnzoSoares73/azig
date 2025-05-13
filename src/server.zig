@@ -79,7 +79,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         pub fn stop(self: *Self) void {
-            print("Stopped server\n", .{});
             uv.uv_stop(self.*.loop);
 
             uv.uv_walk(self.*.loop, struct {
@@ -252,7 +251,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 };
                 const request_raw = ctx.*.allocator.*.dupe(u8, buf.*.base[0..@intCast(nread)]) catch {
                     baton_pool.destroy(baton);
-                    std.debug.print("Failed to copy request data\n", .{});
+                    print("Failed to copy request data\n", .{});
                     return;
                 };
 
@@ -412,8 +411,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
 
-            print("Started server\n", .{});
-
             const loop = uv.uv_default_loop();
             self.loop = loop;
 
@@ -427,8 +424,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_tcp_bind(&server, @ptrCast(&addr), 0);
 
             _ = uv.uv_listen(@ptrCast(&server), 128, on_connection);
-
-            print("Listening on http://0.0.0.0:{d}\n", .{config.port});
 
             _ = uv.uv_run(loop, uv.UV_RUN_DEFAULT);
         }
@@ -457,6 +452,10 @@ test "should start and stop" {
         }
     }.run, .{&server});
 
+    defer {
+        server.stop();
+        thread.join();
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -473,6 +472,4 @@ test "should start and stop" {
     try req.wait();
 
     try testing.expectEqual(req.response.status, std.http.Status.ok);
-    server.stop();
-    thread.join();
 }
