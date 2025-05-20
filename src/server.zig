@@ -161,11 +161,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const header_pool = ctx.*.header_allocator;
             const baton_pool = ctx.*.baton_allocator;
             const arena_pool = ctx.*.arena_allocator;
+            const buffer_pool = ctx.*.buffer_allocator;
 
             const response = baton.*.response;
             const on_write_cb = baton.*.on_write_cb;
             const cleanup_response_cb = baton.*.cleanup_response_cb;
-            const request_raw = baton.*.request_raw;
+            const buffer = baton.*.buffer;
 
             defer {
                 const arena = response.*.arena;
@@ -174,7 +175,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 };
                 arena_pool.destroy(arena);
                 baton_pool.destroy(baton);
-                allocator.free(request_raw);
+                if (buffer != null) {
+                    buffer_pool.destroy(@ptrCast(@alignCast(buffer)));
+                }
             }
 
             const response_text = response.*.to_string(allocator) catch {
@@ -259,13 +262,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
             const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
             const baton_pool = ctx.*.baton_allocator;
-            const buffer_pool = ctx.*.buffer_allocator;
-
-            defer {
-                if (buf.*.base != null) {
-                    buffer_pool.destroy(@ptrCast(@alignCast(buf.*.base)));
-                }
-            }
 
             if (nread < 0 or buf.*.base == null) {
                 if (nread != uv.UV_EOF) {
@@ -279,15 +275,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     print("Failed to allocate baton\n", .{});
                     return;
                 };
-                const request_raw = ctx.*.allocator.*.dupe(u8, buf.*.base[0..@intCast(nread)]) catch {
-                    baton_pool.destroy(baton);
-                    print("Failed to copy request data\n", .{});
-                    return;
-                };
 
                 baton.*.req.data = @ptrCast(@alignCast(baton));
                 baton.*.stream = stream;
-                baton.*.request_raw = request_raw;
+                baton.*.request_raw = buf.*.base[0..@intCast(nread)];
+                baton.*.buffer = buf.*.base;
 
                 const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), process, after_process);
                 if (res != 0) {
