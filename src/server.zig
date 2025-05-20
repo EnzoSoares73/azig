@@ -30,6 +30,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
     const middleware = middleware_t(AppContext, RequestContext);
 
+    const State = struct {
+        context: *anyopaque,
+        timer: uv.uv_timer_t,
+        stream: [*c]uv.uv_stream_t,
+    };
+
+    const state_pool_t = ThreadSafeMemoryPool(State, .{
+        .growable = true,
+    });
+
     const request_pool_t = ThreadSafeMemoryPool(Request, .{
         .growable = true,
     });
@@ -44,9 +54,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         write_req_allocator: *write_req_pool_t,
         baton_allocator: *baton_pool_t,
         arena_allocator: *arena_pool_t,
+        state_allocator: *state_pool_t,
         header_allocator: *header_t,
         app_context: *AppContext,
         middleware_list: []const middleware,
+        timeout: u64,
     };
 
     const init_request_t = struct { request: *Request, cleanup: *const fn (*Request, *header_t, *request_pool_t) anyerror!void };
@@ -83,10 +95,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const ctx: *Context = try allocator.*.create(Context);
             defer allocator.*.destroy(ctx);
+
             ctx.*.allocator = allocator;
             ctx.*.callback = callback;
             ctx.*.app_context = app_context;
             ctx.*.middleware_list = middleware_list;
+            ctx.*.timeout = config.timeout;
 
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
@@ -128,6 +142,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         fn on_connection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
             const ctx: *Context = @ptrCast(@alignCast(server.*.data));
             const client_pool = ctx.client_allocator;
+            const state_pool = ctx.state_allocator;
 
             if (status < 0) {
                 return;
@@ -138,18 +153,34 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             };
 
-            _ = uv.uv_tcp_init(server.*.loop, client);
-            client.*.data = ctx;
+            const state = state_pool.create() catch {
+                print("Failed to allocate state\n", .{});
+                return;
+            };
 
-            if (uv.uv_accept(server, @ptrCast(client)) == 0) {
-                _ = uv.uv_read_start(@ptrCast(client), alloc_buffer, on_read);
+            const stream: [*c]uv.uv_stream_t = @ptrCast(client);
+
+            state.* = .{
+                .context = @ptrCast(@alignCast(ctx)),
+                .timer = undefined,
+                .stream = stream
+            };
+
+            _ = uv.uv_tcp_init(server.*.loop, client);
+            client.*.data = state;
+
+            if (uv.uv_accept(server, stream) == 0) {
+                _ = uv.uv_timer_init(server.*.loop, &state.timer);
+                start_inactivity_timer(state);
+                _ = uv.uv_read_start(stream, alloc_buffer, on_read);
             }
         }
 
         fn after_process(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
             const baton: *Baton = @ptrCast(@alignCast(req.*.data));
             const stream = baton.*.stream;
-            const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
+            const state: *State = @ptrCast(@alignCast(stream.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             if (status < 0) {
                 print("Operation cancelled\n", .{});
@@ -207,14 +238,15 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         fn process(req: [*c]uv.uv_work_t) callconv(.c) void {
             const baton: *Baton = @ptrCast(@alignCast(req.*.data));
             const stream = baton.*.stream;
-            const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
+            const state: *State = @ptrCast(@alignCast(stream.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             const request_pool = ctx.*.request_allocator;
             const response_pool = ctx.*.response_allocator;
             const header_pool = ctx.*.header_allocator;
             const arena_pool = ctx.*.arena_allocator;
-
             const allocator = ctx.*.allocator.*;
+
             const request_raw = baton.*.request_raw;
 
             const arena = arena_pool.create() catch {
@@ -261,8 +293,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
         fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
-            const ctx: *Context = @ptrCast(@alignCast(stream.*.data));
+            const state: *State = @ptrCast(@alignCast(stream.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
             const baton_pool = ctx.*.baton_allocator;
+
+            start_inactivity_timer(state);
 
             if (nread < 0 or buf.*.base == null) {
                 if (nread != uv.UV_EOF) {
@@ -302,18 +337,22 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
-            const ctx: *Context = @ptrCast(@alignCast(req.*.handle.*.data));
+            const state: *State = @ptrCast(@alignCast(req.*.handle.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
             var write_req_pool = ctx.*.write_req_allocator;
             defer write_req_pool.destroy(req);
 
             if (status < 0) {
                 print("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
+            start_inactivity_timer(state);
             _ = uv.uv_read_start(req.*.handle, alloc_buffer, on_read);
         }
 
         fn on_write_complete_no_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
-            const ctx: *Context = @ptrCast(@alignCast(req.*.handle.*.data));
+            const state: *State = @ptrCast(@alignCast(req.*.handle.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
             var write_req_pool = ctx.*.write_req_allocator;
             defer write_req_pool.destroy(req);
 
@@ -348,16 +387,35 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean };
         }
 
+        fn start_inactivity_timer(state: *State) void {
+            state.timer.data = state;
+
+            _ = uv.uv_timer_stop(&state.timer);
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+            _ = uv.uv_timer_start(&state.timer, on_inactivity_timeout, ctx.*.timeout, 0);
+        }
+
+        fn on_inactivity_timeout(handle: [*c]uv.uv_timer_t) callconv(.c) void {
+            const state: *State = @ptrCast(@alignCast(handle.*.data));
+            uv.uv_close(@ptrCast(@alignCast(state.*.stream)), on_close);
+        }
+
         fn on_close(handle: [*c]uv.uv_handle_t) callconv(.C) void {
-            const ctx: *Context = @ptrCast(@alignCast(handle.*.data));
+            const state: *State = @ptrCast(@alignCast(handle.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             const client_pool = ctx.client_allocator;
-            const client: *uv.uv_tcp_t = @alignCast(@ptrCast(handle));
+            const client: *uv.uv_tcp_t = @ptrCast(@alignCast(handle));
             client_pool.*.destroy(client);
+
+            const state_pool = ctx.*.state_allocator;
+            state_pool.*.destroy(state);
         }
 
         fn alloc_buffer(handle: [*c]uv.uv_handle_t, _: usize, buf: [*c]uv.uv_buf_t) callconv(.c) void {
-            const ctx: *Context = @ptrCast(@alignCast(handle.*.data));
+            const state: *State = @ptrCast(@alignCast(handle.*.data));
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
             var buffer_pool = ctx.*.buffer_allocator;
 
             const memory: *[suggested_buffer_size]u8 = buffer_pool.create() catch {
@@ -390,6 +448,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.arena_allocator = try allocator.create(arena_pool_t);
             ctx.*.arena_allocator.* = try arena_pool_t.initPreheated(allocator, pool_size);
 
+            ctx.*.state_allocator = try allocator.create(state_pool_t);
+            ctx.*.state_allocator.* = try state_pool_t.initPreheated(allocator, pool_size);
+
             ctx.*.header_allocator = try allocator.create(header_t);
             ctx.*.header_allocator.* = try header_t.initPreheated(allocator, pool_size * 2);
 
@@ -415,6 +476,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                     ctx_inner.*.arena_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.arena_allocator);
+
+                    ctx_inner.*.state_allocator.deinit();
+                    allocator_inner.destroy(ctx_inner.*.state_allocator);
 
                     ctx_inner.*.header_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.header_allocator);
