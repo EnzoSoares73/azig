@@ -91,11 +91,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
 
-            const loop = uv.uv_default_loop();
-            self.loop = loop;
+            var loop: uv.uv_loop_t = undefined;
+            _ = uv.uv_loop_init(&loop);
+            self.loop = &loop;
 
             var server: uv.uv_tcp_t = undefined;
-            _ = uv.uv_tcp_init(loop, &server);
+            _ = uv.uv_tcp_init(&loop, &server);
             server.data = @constCast(ctx);
             _ = uv.uv_tcp_nodelay(&server, @intCast(0));
 
@@ -105,7 +106,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             _ = uv.uv_listen(@ptrCast(&server), 128, on_connection);
 
-            _ = uv.uv_run(loop, uv.UV_RUN_DEFAULT);
+            _ = uv.uv_run(&loop, uv.UV_RUN_DEFAULT);
         }
 
         pub fn stop(self: *Self) void {
