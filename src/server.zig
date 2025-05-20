@@ -327,7 +327,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (status < 0) {
                 print("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
-            uv.uv_stop(req.*.handle.*.loop);
             _ = uv.uv_close(@ptrCast(req.*.handle), on_close);
         }
 
@@ -447,12 +446,14 @@ test "should start and stop" {
         }
     }.on_response;
 
-    var server = azig.init(&allocator, Config{}, on_response, {});
-    const thread = try std.Thread.spawn(.{}, struct {
+    const run = struct {
         fn run(server_ptr: *azig) !void {
             try server_ptr.start();
         }
-    }.run, .{&server});
+    }.run;
+
+    var server = azig.init(&allocator, Config{}, on_response, {});
+    const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
         server.stop();
