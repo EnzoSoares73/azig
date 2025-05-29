@@ -34,6 +34,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         context: *anyopaque,
         timer: uv.uv_timer_t,
         stream: [*c]uv.uv_stream_t,
+        request_raw: ?[]u8,
     };
 
     const state_pool_t = ThreadSafeMemoryPool(State, .{
@@ -160,11 +161,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const stream: [*c]uv.uv_stream_t = @ptrCast(client);
 
-            state.* = .{
-                .context = @ptrCast(@alignCast(ctx)),
-                .timer = undefined,
-                .stream = stream
-            };
+            state.* = .{ .context = @ptrCast(@alignCast(ctx)), .timer = undefined, .stream = stream, .request_raw = null };
 
             _ = uv.uv_tcp_init(server.*.loop, client);
             client.*.data = state;
@@ -206,10 +203,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     print("Failed to deinit response\n", .{});
                 };
                 arena_pool.destroy(arena);
-                baton_pool.destroy(baton);
                 if (buffer != null) {
                     buffer_pool.destroy(@ptrCast(@alignCast(buffer)));
+                } else {
+                    ctx.*.allocator.free(baton.*.request_raw);
                 }
+                baton_pool.destroy(baton);
             }
 
             const response_text = response.*.to_string(allocator) catch {
@@ -293,20 +292,25 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
         fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
+            print("{*}\n", .{stream});
             const state: *State = @ptrCast(@alignCast(stream.*.data));
+            print("{*}\n", .{state});
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
             const baton_pool = ctx.*.baton_allocator;
-
-            start_inactivity_timer(state);
+            const buffer_pool = ctx.*.buffer_allocator;
 
             if (nread < 0 or buf.*.base == null) {
                 if (nread != uv.UV_EOF) {
                     print("Read error: {s}\n", .{uv.uv_strerror(@intCast(nread))});
                 }
                 _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
+                return;
             }
 
             if (nread > 0) {
+                start_inactivity_timer(state);
+
+                const new_read: usize = @intCast(nread);
                 const baton = baton_pool.create() catch {
                     print("Failed to allocate baton\n", .{});
                     return;
@@ -314,12 +318,48 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                 baton.*.req.data = @ptrCast(@alignCast(baton));
                 baton.*.stream = stream;
-                baton.*.request_raw = buf.*.base[0..@intCast(nread)];
-                baton.*.buffer = buf.*.base;
 
-                const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), process, after_process);
-                if (res != 0) {
-                    _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
+                // if nread < suggested_buffer_size, this is the last read call for this request
+                if (nread < suggested_buffer_size) {
+                    // request_raw being not null means that this isn't the first read call for this request,
+                    // and we need to pass it forward.
+                    if (state.*.request_raw) |request_raw| {
+                        baton.*.request_raw = append_buffer(
+                            ctx.*.allocator.*,
+                            request_raw,
+                            buf.*.base[0..new_read],
+                        ) catch {
+                            return;
+                        };
+                        baton.*.buffer = null;
+                    } else {
+                        baton.*.request_raw = buf.*.base[0..@intCast(nread)];
+                        baton.*.buffer = buf.*.base;
+                    }
+
+                    const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), process, after_process);
+                    if (res != 0) {
+                        _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
+                    }
+                } else {
+                    // if this isn't the last read call of the request, we should copy (and concatenate) the buffer
+                    // value to a new buffer stored in state.*.request_raw. Then, free buffer.
+                    defer buffer_pool.destroy(@ptrCast(@alignCast(buf.*.base)));
+
+                    if (state.*.request_raw) |request_raw| {
+                        state.*.request_raw = append_buffer(
+                            ctx.*.allocator.*,
+                            request_raw,
+                            buf.*.base[0..new_read],
+                        ) catch {
+                            return;
+                        };
+                    } else {
+                        state.*.request_raw = ctx.*.allocator.*.dupe(u8, buf.*.base[0..@intCast(nread)]) catch {
+                            print("Failed to duplicate data\n", .{});
+                            return;
+                        };
+                    }
                 }
             }
         }
@@ -339,6 +379,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
             const state: *State = @ptrCast(@alignCast(req.*.handle.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
             var write_req_pool = ctx.*.write_req_allocator;
             defer write_req_pool.destroy(req);
 
@@ -346,6 +387,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 print("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
             start_inactivity_timer(state);
+            state.*.request_raw = null;
             _ = uv.uv_read_start(req.*.handle, alloc_buffer, on_read);
         }
 
@@ -390,14 +432,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         fn start_inactivity_timer(state: *State) void {
             state.timer.data = state;
 
+            print("{*}\n", .{&state.timer});
             _ = uv.uv_timer_stop(&state.timer);
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
             _ = uv.uv_timer_start(&state.timer, on_inactivity_timeout, ctx.*.timeout, 0);
         }
 
         fn on_inactivity_timeout(handle: [*c]uv.uv_timer_t) callconv(.c) void {
+            print("end\n", .{});
             const state: *State = @ptrCast(@alignCast(handle.*.data));
-            uv.uv_close(@ptrCast(@alignCast(state.*.stream)), on_close);
+            _ = uv.uv_close(@ptrCast(@alignCast(state.*.stream)), on_close);
         }
 
         fn on_close(handle: [*c]uv.uv_handle_t) callconv(.C) void {
@@ -410,6 +454,20 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const state_pool = ctx.*.state_allocator;
             state_pool.*.destroy(state);
+        }
+
+        fn append_buffer(allocator: mem.Allocator, old_data: []u8, new_data: []u8) ![]u8 {
+            const old_len = old_data.len;
+            const new_len = old_len + new_data.len;
+
+            const new_buf = try allocator.alloc(u8, new_len);
+
+            @memcpy(new_buf[0..old_len], old_data);
+            @memcpy(new_buf[old_len..], new_data);
+
+            allocator.free(old_data);
+
+            return new_buf;
         }
 
         fn alloc_buffer(handle: [*c]uv.uv_handle_t, _: usize, buf: [*c]uv.uv_buf_t) callconv(.c) void {
@@ -499,8 +557,7 @@ test "should start and stop" {
     defer _ = gpa.deinit();
 
     const on_response = struct {
-            fn on_response(_: *Request, _: *Response) !void {
-        }
+        fn on_response(_: *Request, _: *Response) !void {}
     }.on_response;
 
     const run = struct {

@@ -10,6 +10,7 @@ const action_t = @import("action.zig").action_t;
 pub const DEFAULT_PORT: u16 = 2500;
 pub const DEFAULT_POOL_SIZE: u16 = 1024;
 pub const DEFAULT_INACTIVITY_TIMEOUT: u64 = 15_000;
+pub const suggested_buffer_size: usize = 65536;
 
 pub fn callback_t(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = request_t(RequestContext);
@@ -27,8 +28,6 @@ pub fn middleware_t(comptime AppContext: type, comptime RequestContext: type) ty
     else
         return *const fn (*AppContext, *Request, *Response, Action) anyerror!void;
 }
-
-pub const suggested_buffer_size: usize = 65536;
 
 pub const buffer_pool_t = ThreadSafeMemoryPool([suggested_buffer_size]u8, .{
     .growable = true,
