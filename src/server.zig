@@ -127,12 +127,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         pub fn stop(self: *Self) void {
             uv.uv_stop(self.*.loop);
 
-            uv.uv_walk(self.*.loop, struct {
-                fn cb(handle: [*c]uv.uv_handle_t, _: ?*anyopaque) callconv(.c) void {
-                    uv.uv_close(handle, null);
-                }
-            }.cb, null);
-
             _ = uv.uv_loop_close(self.loop);
         }
 

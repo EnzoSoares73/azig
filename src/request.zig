@@ -66,6 +66,25 @@ pub fn request_t(comptime RequestContext: type) type {
 
             const path_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return error.InvalidRequest;
             self.path = request_raw[i .. i + path_end];
+
+            if (std.mem.indexOfScalar(u8, self.path, '?')) |query_start| {
+                const path_part = self.path[0..query_start];
+                const query_part = self.path[query_start + 1..];
+
+                self.path = path_part;
+
+                var query_iter = std.mem.splitScalar(u8, query_part, '&');
+                while (query_iter.next()) |param| {
+                    if (std.mem.indexOf(u8, param, "=")) |equals_pos| {
+                        const name = param[0..equals_pos];
+                        const value = param[equals_pos + 1..];
+                        try self.*.params.*.put(name, value);
+                    } else if (param.len > 0) {
+                        try self.*.params.*.put(param, "");
+                    }
+                }
+            }
+
             i += path_end + 1;
 
             const version_end = std.mem.indexOfScalar(u8, request_raw[i..], '\r') orelse return error.InvalidRequest;
@@ -298,6 +317,36 @@ test "request with empty headers" {
 
     try testing.expectEqual(@as(usize, 1), request.headers.*.count());
     try testing.expectEqualStrings("", request.getHeader("Empty-Header").?);
+
+    try request.deinit(&map_pool);
+}
+
+test "request with query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+
+    const request_raw =
+        "GET /path?param1=value1&param2=value2&flag HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parseRequest(mutable_request);
+
+    try request.parseRequest(@constCast(mutable_request));
+
+    try testing.expectEqualStrings("/path", request.path);
+
+    try testing.expectEqual(@as(usize, 3), request.params.*.count());
+    try testing.expectEqualStrings("value1", request.params.*.get("param1").?);
+    try testing.expectEqualStrings("value2", request.params.*.get("param2").?);
+    try testing.expectEqualStrings("", request.params.*.get("flag").?);
 
     try request.deinit(&map_pool);
 }
