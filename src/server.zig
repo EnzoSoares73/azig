@@ -149,7 +149,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
 
-            const client: [*c]uv.uv_tcp_t = client_pool.create() catch {
+            const client = client_pool.create() catch {
                 print("Failed to allocate client\n", .{});
                 return;
             };
@@ -292,10 +292,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
         fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
-            print("{*}\n", .{stream});
             const state: *State = @ptrCast(@alignCast(stream.*.data));
-            print("{*}\n", .{state});
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
             const baton_pool = ctx.*.baton_allocator;
             const buffer_pool = ctx.*.buffer_allocator;
 
@@ -307,9 +306,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
 
-            if (nread > 0) {
-                start_inactivity_timer(state);
-
+            if (nread >= 0) {
                 const new_read: usize = @intCast(nread);
                 const baton = baton_pool.create() catch {
                     print("Failed to allocate baton\n", .{});
@@ -432,14 +429,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         fn start_inactivity_timer(state: *State) void {
             state.timer.data = state;
 
-            print("{*}\n", .{&state.timer});
-            _ = uv.uv_timer_stop(&state.timer);
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
             _ = uv.uv_timer_start(&state.timer, on_inactivity_timeout, ctx.*.timeout, 0);
         }
 
         fn on_inactivity_timeout(handle: [*c]uv.uv_timer_t) callconv(.c) void {
-            print("end\n", .{});
             const state: *State = @ptrCast(@alignCast(handle.*.data));
             _ = uv.uv_close(@ptrCast(@alignCast(state.*.stream)), on_close);
         }
