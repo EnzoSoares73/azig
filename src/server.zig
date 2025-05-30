@@ -277,23 +277,23 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             baton.*.response = response;
             baton.*.cleanup_response_cb = response_struct.cleanup;
 
-            const request_struct = start_request(request_raw, map_pool, request_pool) catch |err| {
-                switch (err) {
-                    error.hostNotFound, error.InvalidRequest => {
-                        response.*.set_bad_request_response();
-                    },
-                    else => {
-                        logger.err("There was an error initializing the request", .{});
-                    },
-                }
-                baton.*.on_write_cb = on_write_complete_no_keep_alive;
+            const request_struct = start_request(map_pool, request_pool) catch |err| {
+                logger.err("There was an error initializing the request: {}", .{err});
                 return;
             };
             const request = request_struct.request;
-            logger.info("{s}", .{request_raw});
+
             defer request_struct.cleanup(request, map_pool, request_pool) catch {
                 logger.err("Failed to deinit request", .{});
             };
+
+            request.*.parseRequest(request_raw) catch {
+                baton.*.on_write_cb = on_write_complete_no_keep_alive;
+                response.*.set_bad_request_response();
+                return;
+            };
+
+            logger.info("{s}", .{request_raw});
 
             handle_callback(ctx, request, response);
 
@@ -432,10 +432,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_close(@ptrCast(req.*.handle), on_close);
         }
 
-        fn start_request(request_raw: []u8, map_pool: *map_t, request_pool: *request_pool_t) !init_request_t {
+        fn start_request(map_pool: *map_t, request_pool: *request_pool_t) !init_request_t {
             const request = try request_pool.create();
             request.* = try Request.init(map_pool);
-            try request.*.parseRequest(request_raw);
 
             return init_request_t{ .request = request, .cleanup = struct {
                 fn clean(inner_request: *Request, inner_map_pool: *map_t, inner_request_pool: *request_pool_t) !void {
