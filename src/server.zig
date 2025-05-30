@@ -166,11 +166,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_tcp_init(server.*.loop, client);
             client.*.data = state;
 
+            _ = uv.uv_timer_init(server.*.loop, &state.timer);
+            state.timer.data = state;
+
             if (uv.uv_accept(server, stream) == 0) {
-                _ = uv.uv_timer_init(server.*.loop, &state.timer);
-                state.timer.data = state;
                 _ = uv.uv_timer_start(&state.timer, on_timeout, ctx.*.timeout, 0);
                 _ = uv.uv_read_start(stream, alloc_buffer, on_read);
+            } else {
+                _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
             }
         }
 
