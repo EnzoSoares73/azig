@@ -3,7 +3,7 @@ const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
 const uv = @import("imports/libuv.zig");
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
-const HeaderPool = @import("pools/header_pool.zig").HeaderPool;
+const MapPool = @import("pools/map_pool.zig").MapPool;
 const request_t = @import("request.zig").request_t;
 const action_t = @import("action.zig").action_t;
 
@@ -53,7 +53,7 @@ pub const arena_pool_t = ThreadSafeMemoryPool(std.heap.ArenaAllocator, .{
     .growable = true,
 });
 
-pub const header_t = HeaderPool(.{
+pub const map_t = MapPool(.{
     .growable = true,
 });
 

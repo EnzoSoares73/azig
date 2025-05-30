@@ -47,7 +47,7 @@ pub fn action_t(comptime AppContext: type, comptime RequestContext: type) type {
 
 const std = @import("std");
 const testing = std.testing;
-const header_t = @import("constants.zig").header_t;
+const map_t = @import("constants.zig").map_t;
 
 test "action_t with void AppContext calls callback when no middlewares" {
     const TestRequestContext = void;
@@ -57,12 +57,12 @@ test "action_t with void AppContext calls callback when no middlewares" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     const Request = request_t(TestRequestContext);
-    var request = try Request.init(&header_pool);
+    var request = try Request.init(&map_pool);
 
     const request_raw: []const u8 =
         "GET /index.html HTTP/1.1\r\n" ++
@@ -106,12 +106,12 @@ test "should return early if middleware does not call next()" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     const Request = request_t(TestRequestContext);
-    var request = try Request.init(&header_pool);
+    var request = try Request.init(&map_pool);
     request.context.counter = 0;
 
     const request_raw: []const u8 =
@@ -164,12 +164,12 @@ test "should call middlewares in order" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     const Request = request_t(TestRequestContext);
-    var request = try Request.init(&header_pool);
+    var request = try Request.init(&map_pool);
     request.context.counter = 0;
 
     const request_raw: []const u8 =
@@ -234,12 +234,12 @@ test "error raised by callback is captured" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     const Request = request_t(TestRequestContext);
-    var request = try Request.init(&header_pool);
+    var request = try Request.init(&map_pool);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {

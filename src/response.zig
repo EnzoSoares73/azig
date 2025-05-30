@@ -2,7 +2,7 @@ const std = @import("std");
 const print = std.debug.print;
 const StringHashMap = std.StringHashMap;
 const mem = std.mem;
-const header_t = @import("constants.zig").header_t;
+const map_t = @import("constants.zig").map_t;
 const testing = std.testing;
 
 pub const ResponseString = struct {
@@ -18,8 +18,8 @@ pub const Response = struct {
 
     const Self = @This();
 
-    pub fn init(arena: *std.heap.ArenaAllocator, header_pool: *header_t) !Self {
-        const map = try header_pool.*.create();
+    pub fn init(arena: *std.heap.ArenaAllocator, map_pool: *map_t) !Self {
+        const map = try map_pool.*.create();
         return Self{
             .body = null,
             .headers = map,
@@ -28,8 +28,8 @@ pub const Response = struct {
         };
     }
 
-    pub fn deinit(self: *Self, header_pool: *header_t) !void {
-        try header_pool.*.destroy(self.*.headers);
+    pub fn deinit(self: *Self, map_pool: *map_t) !void {
+        try map_pool.*.destroy(self.*.headers);
         self.* = undefined;
     }
 
@@ -144,15 +144,15 @@ test "Response initialization and cleanup" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     try testing.expectEqual(@as(u16, 200), response.status_code);
     try testing.expectEqual(@as(?[]const u8, null), response.body);
     try testing.expectEqual(@as(usize, 0), response.headers.count());
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }
 
 test "Response addHeader" {
@@ -160,9 +160,9 @@ test "Response addHeader" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     try response.addHeader("Content-Type", "application/json");
     try response.addHeader("X-Custom-Header", "test-value");
@@ -171,7 +171,7 @@ test "Response addHeader" {
     try testing.expectEqualStrings("application/json", response.headers.get("Content-Type").?);
     try testing.expectEqualStrings("test-value", response.headers.get("X-Custom-Header").?);
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }
 
 test "Response to_string with small response" {
@@ -179,9 +179,9 @@ test "Response to_string with small response" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     try response.addHeader("Content-Type", "text/plain");
     response.body = "Hello, World!";
@@ -195,7 +195,7 @@ test "Response to_string with small response" {
     try testing.expect(mem.indexOf(u8, response_str.string, "Content-Length: 13\r\n") != null);
     try testing.expect(mem.endsWith(u8, response_str.string, "\r\n\r\nHello, World!"));
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }
 
 test "Response to_string with large response" {
@@ -203,9 +203,9 @@ test "Response to_string with large response" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     const body_size = 5000;
     const large_body = try allocator.alloc(u8, body_size);
@@ -221,7 +221,7 @@ test "Response to_string with large response" {
     try testing.expect(mem.indexOf(u8, response_str.string, "Content-Length: 5000\r\n") != null);
     try testing.expect(mem.indexOf(u8, response_str.string, "\r\n\r\n").? + 4 + body_size == response_str.string.len);
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }
 
 test "Response status code strings" {
@@ -229,9 +229,9 @@ test "Response status code strings" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     // Test known status codes
     response.status_code = 200;
@@ -250,7 +250,7 @@ test "Response status code strings" {
     defer if (response_str.in_heap) allocator.free(response_str.string);
     try testing.expect(mem.startsWith(u8, response_str.string, "HTTP/1.1 999 Unknown\r\n"));
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }
 
 test "Response with no body" {
@@ -258,9 +258,9 @@ test "Response with no body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
     try response.addHeader("X-Empty", "true");
     response.body = null;
 
@@ -272,7 +272,7 @@ test "Response with no body" {
     try testing.expect(mem.indexOf(u8, response_str.string, "Content-Length: 0\r\n") != null);
     try testing.expect(mem.endsWith(u8, response_str.string, "\r\n\r\n"));
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }
 
 test "Response calculate_serialized_size" {
@@ -280,9 +280,9 @@ test "Response calculate_serialized_size" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var response = try Response.init(&arena, &header_pool);
+    var response = try Response.init(&arena, &map_pool);
 
     try response.addHeader("Content-Type", "text/html");
     response.body = "<html></html>";
@@ -297,5 +297,5 @@ test "Response calculate_serialized_size" {
 
     try testing.expectEqual(expected_size, size);
 
-    try response.deinit(&header_pool);
+    try response.deinit(&map_pool);
 }

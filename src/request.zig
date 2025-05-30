@@ -3,7 +3,7 @@ const print = std.debug.print;
 const StringHashMap = std.StringHashMap;
 const mem = std.mem;
 const ascii = std.ascii;
-const header_t = @import("constants.zig").header_t;
+const map_t = @import("constants.zig").map_t;
 const testing = std.testing;
 const supported_versions = @import("constants.zig").supported_versions;
 
@@ -13,16 +13,17 @@ pub fn request_t(comptime RequestContext: type) type {
         path: []const u8,
         version: []const u8,
         headers: *StringHashMap([]const u8),
+        params: *StringHashMap([]const u8),
         body: ?[]const u8,
         context: RequestContext,
 
         const Self = @This();
 
-        pub fn init(header_pool: *header_t) !Self {
-            const map = try header_pool.*.create();
+        pub fn init(map_pool: *map_t) !Self {
             return Self{
                 .body = null,
-                .headers = map,
+                .headers = try map_pool.*.create(),
+                .params = try map_pool.*.create(),
                 .method = undefined,
                 .path = undefined,
                 .version = undefined,
@@ -30,8 +31,8 @@ pub fn request_t(comptime RequestContext: type) type {
             };
         }
 
-        pub fn deinit(self: *Self, header_pool: *header_t) !void {
-            try header_pool.*.destroy(self.*.headers);
+        pub fn deinit(self: *Self, map_pool: *map_t) !void {
+            try map_pool.*.destroy(self.*.headers);
             self.* = undefined;
         }
 
@@ -120,13 +121,13 @@ test "Request initialization and cleanup" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     try testing.expect(request.body == null);
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }
 
 test "parse simple GET request" {
@@ -134,9 +135,9 @@ test "parse simple GET request" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     const request_raw: []const u8 =
         "GET /index.html HTTP/1.1\r\n" ++
@@ -158,7 +159,7 @@ test "parse simple GET request" {
     try testing.expectEqualStrings("example.com", request.getHeader("Host").?);
     try testing.expectEqualStrings("test-agent", request.getHeader("User-Agent").?);
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }
 
 test "parse POST request with body" {
@@ -166,9 +167,9 @@ test "parse POST request with body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -191,7 +192,7 @@ test "parse POST request with body" {
     try testing.expectEqualStrings("application/json", request.getHeader("Content-Type").?);
     try testing.expectEqualStrings("18", request.getHeader("Content-Length").?);
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }
 
 test "header name capitalization" {
@@ -199,9 +200,9 @@ test "header name capitalization" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -220,7 +221,7 @@ test "header name capitalization" {
     try testing.expect(request.getHeader("User-Agent") != null);
     try testing.expect(request.getHeader("X-Custom-Header") != null);
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }
 
 test "invalid request format" {
@@ -228,9 +229,9 @@ test "invalid request format" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     try testing.expectError(error.InvalidRequest, request.parseRequest(@constCast("/path HTTP/1.1\r\n\r\n")));
 
@@ -240,7 +241,7 @@ test "invalid request format" {
 
     try testing.expectError(error.InvalidHeader, request.parseRequest(@constCast("GET /path HTTP/1.1\r\ninvalidheader\r\n\r\n")));
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }
 
 test "request with multiple headers" {
@@ -248,9 +249,9 @@ test "request with multiple headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -272,7 +273,7 @@ test "request with multiple headers" {
     try testing.expectEqualStrings("en-US", request.getHeader("Accept-Language").?);
     try testing.expectEqualStrings("keep-alive", request.getHeader("Connection").?);
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }
 
 test "request with empty headers" {
@@ -280,9 +281,9 @@ test "request with empty headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var header_pool = header_t.init(allocator);
+    var map_pool = map_t.init(allocator);
 
-    var request = try request_t(void).init(&header_pool);
+    var request = try request_t(void).init(&map_pool);
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -298,5 +299,5 @@ test "request with empty headers" {
     try testing.expectEqual(@as(usize, 1), request.headers.*.count());
     try testing.expectEqualStrings("", request.getHeader("Empty-Header").?);
 
-    try request.deinit(&header_pool);
+    try request.deinit(&map_pool);
 }

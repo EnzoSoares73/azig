@@ -8,7 +8,7 @@ pub const Options = struct {
 
 pub const MemoryPoolError = error{OutOfMemory};
 
-pub fn HeaderPool(comptime options: Options) type {
+pub fn MapPool(comptime options: Options) type {
     const MapType = StringHashMap([]const u8);
 
     return struct {
