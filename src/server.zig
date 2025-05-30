@@ -116,10 +116,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_tcp_nodelay(&server, @intCast(0));
 
             var addr: uv.struct_sockaddr_in = undefined;
-            _ = uv.uv_ip4_addr("0.0.0.0", @intCast(config.port), &addr);
+            _ = uv.uv_ip4_addr(@ptrCast(config.listen_address), @intCast(config.port), &addr);
             _ = uv.uv_tcp_bind(&server, @ptrCast(&addr), 0);
 
-            _ = uv.uv_listen(@ptrCast(&server), 128, on_connection);
+            _ = uv.uv_listen(@ptrCast(&server), config.backlog_size, on_connection);
 
             _ = uv.uv_run(&loop, uv.UV_RUN_DEFAULT);
         }
