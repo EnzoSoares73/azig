@@ -252,21 +252,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             const request_pool = ctx.*.request_allocator;
-            const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
-            const arena_pool = ctx.*.arena_allocator;
-            const allocator = ctx.*.allocator.*;
 
             const request_raw = baton.*.request_raw;
 
-            const arena = arena_pool.create() catch {
-                logger.err("There was an error initializing the arena", .{});
-                return;
-            };
-            arena.* = std.heap.ArenaAllocator.init(allocator);
-
-            const response_struct = start_response(arena, map_pool, response_pool) catch {
-                logger.err("There was an error initializing the response", .{});
+            const response_struct = create_response(ctx) catch {
                 return;
             };
             const response = response_struct.response;
@@ -454,16 +444,34 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean };
         }
 
+        fn create_response(ctx: *Context) !init_response_t {
+            const response_pool = ctx.*.response_allocator;
+            const map_pool = ctx.*.map_allocator;
+            const arena_pool = ctx.*.arena_allocator;
+            const allocator = ctx.*.allocator.*;
+
+            const arena = arena_pool.create() catch {
+                logger.err("There was an error initializing the arena", .{});
+                return error.ArenaInitFailed;
+            };
+            arena.* = std.heap.ArenaAllocator.init(allocator);
+
+            const response_struct = start_response(arena, map_pool, response_pool) catch {
+                logger.err("There was an error initializing the response", .{});
+                return error.ResponseInitFailed;
+            };
+
+            return response_struct;
+        }
+
         fn on_timeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
             logger.info("Connection closing due to inactivity", .{});
 
             const state: *State = @ptrCast(@alignCast(timer.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
-            const allocator = ctx.*.allocator.*;
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
-            const arena_pool = ctx.*.arena_allocator;
 
             const stream = state.*.stream;
 
@@ -471,14 +479,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 _ = uv.uv_close(@ptrCast(stream), on_close);
             } else {
                 state.*.is_idle = true;
-                const arena = arena_pool.create() catch {
-                    logger.err("There was an error initializing the arena", .{});
-                    return;
-                };
-                arena.* = std.heap.ArenaAllocator.init(allocator);
 
-                const response_struct = start_response(arena, map_pool, response_pool) catch {
-                    logger.err("There was an error initializing the response", .{});
+                const response_struct = create_response(ctx) catch {
                     return;
                 };
                 response_struct.response.*.set_timeout_response();
