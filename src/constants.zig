@@ -1,4 +1,5 @@
 const std = @import("std");
+const State = @import("state.zig").State;
 const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
 const uv = @import("imports/libuv.zig");
@@ -55,8 +56,12 @@ pub const arena_pool_t = ThreadSafeMemoryPool(std.heap.ArenaAllocator, .{
     .growable = true,
 });
 
+pub const state_pool_t = ThreadSafeMemoryPool(State, .{
+    .growable = true,
+});
+
 pub const map_t = MapPool(.{
     .growable = true,
 });
 
-pub const supported_versions = [_][]const u8{ "HTTP/1.1" };
+pub const supported_versions = [_][]const u8{"HTTP/1.1"};

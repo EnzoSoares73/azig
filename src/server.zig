@@ -1,11 +1,13 @@
+/// Represents a HTTP server implementation using libuv
+
 const std = @import("std");
 const mem = std.mem;
-const print = std.debug.print;
 const uv = @import("imports/libuv.zig");
 const Config = @import("config.zig").Config;
 const request_t = @import("request.zig").request_t;
 const Response = @import("response.zig").Response;
 const Baton = @import("baton.zig").Baton;
+const State = @import("state.zig").State;
 const action_t = @import("action.zig").action_t;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
 const callback_t = @import("constants.zig").callback_t;
@@ -17,12 +19,19 @@ const baton_pool_t = @import("constants.zig").baton_pool_t;
 const work_pool_t = @import("constants.zig").work_pool_t;
 const write_req_pool_t = @import("constants.zig").write_req_pool_t;
 const arena_pool_t = @import("constants.zig").arena_pool_t;
+const state_pool_t = @import("constants.zig").state_pool_t;
 const middleware_t = @import("constants.zig").middleware_t;
 const map_t = @import("constants.zig").map_t;
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 
+const logger = std.log.scoped(.server);
+
 pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = request_t(RequestContext);
+
+    const request_pool_t = ThreadSafeMemoryPool(Request, .{
+        .growable = true,
+    });
 
     const callback_fn = callback_t(AppContext, RequestContext);
 
@@ -30,21 +39,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
     const middleware = middleware_t(AppContext, RequestContext);
 
-    const State = struct {
-        context: *anyopaque,
-        timer: uv.uv_timer_t,
-        stream: [*c]uv.uv_stream_t,
-        request_raw: ?[]u8,
-    };
-
-    const state_pool_t = ThreadSafeMemoryPool(State, .{
-        .growable = true,
-    });
-
-    const request_pool_t = ThreadSafeMemoryPool(Request, .{
-        .growable = true,
-    });
-
+    //Application-wide context
     const Context = struct {
         allocator: *std.mem.Allocator,
         callback: callback_fn,
@@ -88,6 +83,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         pub fn start(self: *Self) !void {
+            logger.info("Starting server", .{});
+
             const allocator = self.allocator;
             const config = self.config;
             const callback = self.callback;
@@ -105,9 +102,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
+            logger.info("Pools allocated", .{});
 
             var loop: uv.uv_loop_t = undefined;
-            _ = uv.uv_loop_init(&loop);
+            const result = uv.uv_loop_init(&loop);
+            if (result < 0) {
+                return error.LoopInitFailed;
+            }
+
             self.loop = &loop;
 
             var server: uv.uv_tcp_t = undefined;
@@ -121,6 +123,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             _ = uv.uv_listen(@ptrCast(&server), config.backlog_size, on_connection);
 
+            logger.info("Server started", .{});
             _ = uv.uv_run(&loop, uv.UV_RUN_DEFAULT);
         }
 
@@ -128,6 +131,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             uv.uv_stop(self.*.loop);
 
             _ = uv.uv_loop_close(self.loop);
+            logger.info("Server stopped", .{});
         }
 
         pub fn register_middleware(self: *Self, middleware_list: []const middleware) void {
@@ -144,12 +148,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
 
             const client = client_pool.create() catch {
-                print("Failed to allocate client\n", .{});
+                logger.err("Failed to allocate client\n", .{});
                 return;
             };
 
             const state = state_pool.create() catch {
-                print("Failed to allocate state\n", .{});
+                logger.err("Failed to allocate state\n", .{});
                 return;
             };
 
@@ -164,6 +168,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             state.timer.data = state;
 
             if (uv.uv_accept(server, stream) == 0) {
+                logger.info("Connection accepted", .{});
                 _ = uv.uv_timer_start(&state.timer, on_timeout, ctx.*.timeout, 0);
                 _ = uv.uv_read_start(stream, alloc_buffer, on_read);
             } else {
@@ -178,7 +183,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             if (status < 0) {
-                print("Operation cancelled\n", .{});
+                logger.err("Operation cancelled\n", .{});
                 return;
             }
 
@@ -198,7 +203,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             defer {
                 const arena = response.*.arena;
                 cleanup_response_cb(response, map_pool, response_pool) catch {
-                    print("Failed to deinit response\n", .{});
+                    logger.err("Failed to deinit response\n", .{});
                 };
                 arena_pool.destroy(arena);
                 if (buffer != null) {
@@ -210,7 +215,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
 
             const response_text = response.*.to_string(allocator) catch {
-                print("Failed to write response\n", .{});
+                logger.err("Failed to write response\n", .{});
                 return;
             };
             if (response_text.in_heap) {
@@ -218,7 +223,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
 
             const write_req = write_req_pool.create() catch {
-                print("Failed to allocate write_req\n", .{});
+                logger.err("Failed to allocate write_req\n", .{});
                 return;
             };
 
@@ -247,22 +252,23 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const request_raw = baton.*.request_raw;
 
             const arena = arena_pool.create() catch {
-                print("There was an error initializing the arena\n", .{});
+                logger.err("There was an error initializing the arena\n", .{});
                 return;
             };
             arena.* = std.heap.ArenaAllocator.init(allocator);
 
             const request_struct = start_request(request_raw, map_pool, request_pool) catch {
-                print("There was an error initializing the request\n", .{});
+                logger.err("There was an error initializing the request\n", .{});
                 return;
             };
             const request = request_struct.request;
+            logger.info("{s}", .{request_raw});
             defer request_struct.cleanup(request, map_pool, request_pool) catch {
-                print("Failed to deinit request\n", .{});
+                logger.err("Failed to deinit request\n", .{});
             };
 
             const response_struct = start_response(arena, map_pool, response_pool) catch {
-                print("There was an error initializing the response\n", .{});
+                logger.err("There was an error initializing the response\n", .{});
                 return;
             };
             const response = response_struct.response;
@@ -300,7 +306,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             if (nread < 0 or buf.*.base == null) {
                 if (nread != uv.UV_EOF) {
-                    print("Read error: {s}\n", .{uv.uv_strerror(@intCast(nread))});
+                    logger.err("Read error: {s}\n", .{uv.uv_strerror(@intCast(nread))});
                 }
                 _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
                 return;
@@ -309,7 +315,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (nread >= 0) {
                 const new_read: usize = @intCast(nread);
                 const baton = baton_pool.create() catch {
-                    print("Failed to allocate baton\n", .{});
+                    logger.err("Failed to allocate baton\n", .{});
                     return;
                 };
 
@@ -341,6 +347,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 } else {
                     // if this isn't the last read call of the request, we should copy (and concatenate) the buffer
                     // value to a new buffer stored in state.*.request_raw. Then, free buffer.
+
+                    logger.info("Buffer not big enough", .{});
                     defer buffer_pool.destroy(@ptrCast(@alignCast(buf.*.base)));
 
                     if (state.*.request_raw) |request_raw| {
@@ -353,7 +361,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                         };
                     } else {
                         state.*.request_raw = ctx.*.allocator.*.dupe(u8, buf.*.base[0..@intCast(nread)]) catch {
-                            print("Failed to duplicate data\n", .{});
+                            logger.err("Failed to duplicate data\n", .{});
                             return;
                         };
                     }
@@ -373,7 +381,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             return true;
         }
 
-        fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
+        fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.c) void {
             const state: *State = @ptrCast(@alignCast(req.*.handle.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
@@ -381,7 +389,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             defer write_req_pool.destroy(req);
 
             if (status < 0) {
-                print("Write error: {s}\n", .{uv.uv_strerror(status)});
+                logger.err("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
 
             _ = uv.uv_timer_start(&state.*.timer, on_timeout, ctx.*.timeout, 0);
@@ -390,7 +398,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_read_start(req.*.handle, alloc_buffer, on_read);
         }
 
-        fn on_write_complete_no_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.C) void {
+        fn on_write_complete_no_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.c) void {
             const state: *State = @ptrCast(@alignCast(req.*.handle.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
@@ -398,7 +406,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             defer write_req_pool.destroy(req);
 
             if (status < 0) {
-                print("Write error: {s}\n", .{uv.uv_strerror(status)});
+                logger.err("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
             _ = uv.uv_close(@ptrCast(req.*.handle), on_close);
         }
@@ -428,14 +436,18 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean };
         }
 
-        fn on_timeout(timer: [*c]uv.uv_timer_t) callconv(.C) void {
+        fn on_timeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
+            logger.info("Connection closing due to inactivity", .{});
+
             const state: *State = @ptrCast(@alignCast(timer.*.data));
             const stream = state.*.stream;
 
             _ = uv.uv_close(@ptrCast(stream), on_close);
         }
 
-        fn on_close(handle: [*c]uv.uv_handle_t) callconv(.C) void {
+        fn on_close(handle: [*c]uv.uv_handle_t) callconv(.c) void {
+            logger.info("Connection closed", .{});
+
             const state: *State = @ptrCast(@alignCast(handle.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
