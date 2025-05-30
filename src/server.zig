@@ -158,7 +158,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const stream: [*c]uv.uv_stream_t = @ptrCast(client);
 
-            state.* = .{ .context = @ptrCast(@alignCast(ctx)), .timer = undefined, .stream = stream, .request_raw = null, .is_idle = true };
+            state.* = .{
+                .context = @ptrCast(@alignCast(ctx)),
+                .timer = undefined,
+                .stream = stream,
+                .request_raw = null,
+                .is_idle = true
+            };
 
             _ = uv.uv_tcp_init(server.*.loop, client);
             client.*.data = state;
@@ -209,12 +215,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const baton: *Baton = @ptrCast(@alignCast(req.*.data));
             const stream = baton.*.stream;
             const state: *State = @ptrCast(@alignCast(stream.*.data));
+            const handle: [*c]uv.uv_handle_t = @ptrCast(@alignCast(stream));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
-
-            if (status < 0 or state.*.is_idle == true or @intFromPtr(state.*.stream) == 0) {
-                logger.info("Operation cancelled", .{});
-                return;
-            }
 
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
@@ -226,6 +228,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const on_write_cb = baton.*.on_write_cb;
             const cleanup_response_cb = baton.*.cleanup_response_cb;
             const buffer = baton.*.buffer;
+
+            state.*.is_idle = true;
 
             defer {
                 const arena = response.*.arena;
@@ -239,10 +243,19 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx.*.allocator.free(baton.*.request_raw);
                 }
                 baton_pool.destroy(baton);
-                state.*.is_idle = true;
             }
 
-            send_response(response, state, on_write_cb);
+            if (status < 0) {
+                logger.info("Operation cancelled", .{});
+                on_close(handle);
+                return;
+            }
+
+            if (uv.uv_is_active(handle) == 1) {
+                send_response(response, state, on_write_cb);
+            } else {
+                on_close(handle);
+            }
         }
 
         fn process(req: [*c]uv.uv_work_t) callconv(.c) void {
@@ -472,22 +485,23 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
+            const arena_pool = ctx.*.arena_allocator;
 
             const stream = state.*.stream;
 
             if (state.*.is_idle) {
                 _ = uv.uv_close(@ptrCast(stream), on_close);
             } else {
-                state.*.is_idle = true;
-
                 const response_struct = create_response(ctx) catch {
                     return;
                 };
                 response_struct.response.*.set_timeout_response();
                 defer {
+                    const arena = response_struct.response.*.arena;
                     response_struct.cleanup(response_struct.response, map_pool, response_pool) catch {
                         logger.err("Failed to deinit response", .{});
                     };
+                    arena_pool.destroy(arena);
                 }
 
                 send_response(response_struct.response, state, on_write_complete_no_keep_alive);
@@ -495,19 +509,20 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         fn on_close(handle: [*c]uv.uv_handle_t) callconv(.c) void {
-            logger.info("Connection closed", .{});
-
             const state: *State = @ptrCast(@alignCast(handle.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             _ = uv.uv_timer_stop(&state.*.timer);
 
-            const client_pool = ctx.client_allocator;
-            const client: *uv.uv_tcp_t = @ptrCast(@alignCast(handle));
-            client_pool.*.destroy(client);
+            if (state.*.is_idle) {
+                logger.info("Connection closed", .{});
+                const client_pool = ctx.client_allocator;
+                const client: *uv.uv_tcp_t = @ptrCast(@alignCast(handle));
+                client_pool.*.destroy(client);
 
-            const state_pool = ctx.*.state_allocator;
-            state_pool.*.destroy(state);
+                const state_pool = ctx.*.state_allocator;
+                state_pool.*.destroy(state);
+            }
         }
 
         fn append_buffer(allocator: mem.Allocator, old_data: []u8, new_data: []u8) ![]u8 {

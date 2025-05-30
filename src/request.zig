@@ -33,6 +33,7 @@ pub fn request_t(comptime RequestContext: type) type {
 
         pub fn deinit(self: *Self, map_pool: *map_t) !void {
             try map_pool.*.destroy(self.*.headers);
+            try map_pool.*.destroy(self.*.params);
             self.* = undefined;
         }
 
