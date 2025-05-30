@@ -257,8 +257,24 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             };
             arena.* = std.heap.ArenaAllocator.init(allocator);
 
-            const request_struct = start_request(request_raw, map_pool, request_pool) catch {
-                logger.err("There was an error initializing the request\n", .{});
+            const response_struct = start_response(arena, map_pool, response_pool) catch {
+                logger.err("There was an error initializing the response\n", .{});
+                return;
+            };
+            const response = response_struct.response;
+
+            baton.*.response = response;
+            baton.*.cleanup_response_cb = response_struct.cleanup;
+
+            const request_struct = start_request(request_raw, map_pool, request_pool) catch |err| {
+                switch (err) {
+                    error.hostNotFound, error.InvalidRequest => {
+                        response.*.set_bad_request_response();
+                    }, else => {
+                        logger.err("There was an error initializing the request\n", .{});
+                    }
+                }
+                baton.*.on_write_cb = on_write_complete_no_keep_alive;
                 return;
             };
             const request = request_struct.request;
@@ -267,17 +283,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 logger.err("Failed to deinit request\n", .{});
             };
 
-            const response_struct = start_response(arena, map_pool, response_pool) catch {
-                logger.err("There was an error initializing the response\n", .{});
-                return;
-            };
-            const response = response_struct.response;
-
             handle_callback(ctx, request, response);
 
-            baton.*.response = response;
             baton.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
-            baton.*.cleanup_response_cb = response_struct.cleanup;
         }
 
         fn handle_callback(ctx: *Context, request: *Request, response: *Response) void {

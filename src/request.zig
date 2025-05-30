@@ -69,7 +69,7 @@ pub fn request_t(comptime RequestContext: type) type {
 
             if (std.mem.indexOfScalar(u8, self.path, '?')) |query_start| {
                 const path_part = self.path[0..query_start];
-                const query_part = self.path[query_start + 1..];
+                const query_part = self.path[query_start + 1 ..];
 
                 self.path = path_part;
 
@@ -77,7 +77,7 @@ pub fn request_t(comptime RequestContext: type) type {
                 while (query_iter.next()) |param| {
                     if (std.mem.indexOf(u8, param, "=")) |equals_pos| {
                         const name = param[0..equals_pos];
-                        const value = param[equals_pos + 1..];
+                        const value = param[equals_pos + 1 ..];
                         try self.*.params.*.put(name, value);
                     } else if (param.len > 0) {
                         try self.*.params.*.put(param, "");
@@ -98,6 +98,7 @@ pub fn request_t(comptime RequestContext: type) type {
             }
             i += version_end + 2;
 
+            var hasHostHeader = false;
             while (i < request_raw.len) {
                 if (i + 1 < request_raw.len and request_raw[i] == '\r' and request_raw[i + 1] == '\n') {
                     i += 2;
@@ -111,8 +112,16 @@ pub fn request_t(comptime RequestContext: type) type {
                 const value = std.mem.trim(u8, request_raw[i + colon_pos + 1 .. line_end], " ");
 
                 capitalizeHeaderName(@constCast(key));
+                if (std.mem.eql(u8, key, "Host")) {
+                    hasHostHeader = isValidHost(value);
+                }
+
                 try self.*.headers.*.put(key, value);
                 i = line_end + 2;
+            }
+
+            if (!hasHostHeader) {
+                return error.hostNotFound;
             }
 
             if (i < request_raw.len) {
@@ -131,6 +140,48 @@ pub fn request_t(comptime RequestContext: type) type {
                     capitalize = (c.* == '-');
                 }
             }
+        }
+
+        fn isValidHost(host: []const u8) bool {
+            var iterator = std.mem.splitScalar(u8, host, ':');
+            const first = iterator.next();
+            if (first) |hostname| {
+                if (std.net.Address.parseIp(hostname, @intCast(0))) |_| {
+                    return true;
+                } else |_| {
+                    return isValidDomain(hostname);
+                }
+            }
+            return false;
+        }
+
+        fn isValidDomain(domain: []const u8) bool {
+            if (domain.len == 0 or domain.len > 253) {
+                return false;
+            }
+
+            var labels = std.mem.splitScalar(u8, domain, '.');
+            var label_count: usize = 0;
+
+            while (labels.next()) |label| {
+                label_count += 1;
+
+                if (label.len == 0 or label.len > 63) {
+                    return false;
+                }
+
+                if (label[0] == '-' or label[label.len - 1] == '-') {
+                    return false;
+                }
+
+                for (label) |c| {
+                    if (!ascii.isAlphanumeric(c) and c != '-') {
+                        return false;
+                    }
+                }
+            }
+
+            return label_count > 0;
         }
     };
 }
@@ -192,6 +243,7 @@ test "parse POST request with body" {
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
+        "host: example.com\r\n" ++
         "Content-Type: application/json\r\n" ++
         "Content-Length: 18\r\n" ++
         "\r\n" ++
@@ -225,6 +277,7 @@ test "header name capitalization" {
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
+        "host: example.com\r\n" ++
         "content-type: text/html\r\n" ++
         "user-AGENT: test-agent\r\n" ++
         "x-custom-header: value\r\n" ++
@@ -306,6 +359,7 @@ test "request with empty headers" {
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
+        "host: example.com\r\n" ++
         "Empty-Header: \r\n" ++
         "\r\n";
 
@@ -315,7 +369,7 @@ test "request with empty headers" {
 
     try request.parseRequest(@constCast(mutable_request));
 
-    try testing.expectEqual(@as(usize, 1), request.headers.*.count());
+    try testing.expectEqual(@as(usize, 2), request.headers.*.count());
     try testing.expectEqualStrings("", request.getHeader("Empty-Header").?);
 
     try request.deinit(&map_pool);
@@ -349,4 +403,162 @@ test "request with query parameters" {
     try testing.expectEqualStrings("", request.params.*.get("flag").?);
 
     try request.deinit(&map_pool);
+}
+
+test "host validation" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    // Test valid IP addresses
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: 192.168.1.1\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try request.parseRequest(mutable_request);
+    }
+
+    // Test valid IP address with port
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: 192.168.1.1:8080\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try request.parseRequest(mutable_request);
+    }
+
+    // Test valid domain name
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try request.parseRequest(mutable_request);
+    }
+
+    // Test valid domain name with subdomain
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: sub.example.com\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try request.parseRequest(mutable_request);
+    }
+
+    // Test valid domain name with port
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: example.com:8080\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try request.parseRequest(mutable_request);
+    }
+
+    // Test domain with hyphens
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: my-example-domain.com\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try request.parseRequest(mutable_request);
+    }
+
+    // Test invalid domain (starts with hyphen)
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: -example.com\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try testing.expectError(error.hostNotFound, request.parseRequest(mutable_request));
+    }
+
+    // Test invalid domain (ends with hyphen)
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: example-.com\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try testing.expectError(error.hostNotFound, request.parseRequest(mutable_request));
+    }
+
+    // Test invalid domain (contains invalid character)
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: example!.com\r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try testing.expectError(error.hostNotFound, request.parseRequest(mutable_request));
+    }
+
+    // Test empty host
+    {
+        var request = try request_t(void).init(&map_pool);
+        defer request.deinit(&map_pool) catch {};
+
+        const request_raw =
+            "GET / HTTP/1.1\r\n" ++
+            "Host: \r\n" ++
+            "\r\n";
+
+        const mutable_request = try allocator.dupe(u8, request_raw);
+        defer allocator.free(mutable_request);
+        try testing.expectError(error.hostNotFound, request.parseRequest(mutable_request));
+    }
 }

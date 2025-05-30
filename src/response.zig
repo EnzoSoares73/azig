@@ -124,6 +124,12 @@ pub const Response = struct {
         self.*.status_code = 500;
     }
 
+    pub fn set_bad_request_response(self: *Self) void {
+        self.*.headers.clearRetainingCapacity();
+        self.*.body = null;
+        self.*.status_code = 400;
+    }
+
     fn statusCodeToString(code: u16) ?[]const u8 {
         return switch (code) {
             200 => "OK",
