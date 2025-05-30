@@ -168,7 +168,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             if (uv.uv_accept(server, stream) == 0) {
                 _ = uv.uv_timer_init(server.*.loop, &state.timer);
-                start_inactivity_timer(state);
+                state.timer.data = state;
+                _ = uv.uv_timer_start(&state.timer, on_timeout, ctx.*.timeout, 0);
                 _ = uv.uv_read_start(stream, alloc_buffer, on_read);
             }
         }
@@ -295,6 +296,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const state: *State = @ptrCast(@alignCast(stream.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
+            _ = uv.uv_timer_start(&state.*.timer, on_timeout, ctx.*.timeout, 0);
+
             const baton_pool = ctx.*.baton_allocator;
             const buffer_pool = ctx.*.buffer_allocator;
 
@@ -383,7 +386,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (status < 0) {
                 print("Write error: {s}\n", .{uv.uv_strerror(status)});
             }
-            start_inactivity_timer(state);
+
+            _ = uv.uv_timer_start(&state.*.timer, on_timeout, ctx.*.timeout, 0);
+
             state.*.request_raw = null;
             _ = uv.uv_read_start(req.*.handle, alloc_buffer, on_read);
         }
@@ -426,21 +431,18 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }.clean };
         }
 
-        fn start_inactivity_timer(state: *State) void {
-            state.timer.data = state;
+        fn on_timeout(timer: [*c]uv.uv_timer_t) callconv(.C) void {
+            const state: *State = @ptrCast(@alignCast(timer.*.data));
+            const stream = state.*.stream;
 
-            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
-            _ = uv.uv_timer_start(&state.timer, on_inactivity_timeout, ctx.*.timeout, 0);
-        }
-
-        fn on_inactivity_timeout(handle: [*c]uv.uv_timer_t) callconv(.c) void {
-            const state: *State = @ptrCast(@alignCast(handle.*.data));
-            _ = uv.uv_close(@ptrCast(@alignCast(state.*.stream)), on_close);
+            _ = uv.uv_close(@ptrCast(stream), on_close);
         }
 
         fn on_close(handle: [*c]uv.uv_handle_t) callconv(.C) void {
             const state: *State = @ptrCast(@alignCast(handle.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
+            _ = uv.uv_timer_stop(&state.*.timer);
 
             const client_pool = ctx.client_allocator;
             const client: *uv.uv_tcp_t = @ptrCast(@alignCast(handle));
