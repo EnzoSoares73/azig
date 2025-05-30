@@ -175,6 +175,36 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
+        fn send_response(response: *Response, state: *State, on_write_cb: uv.uv_write_cb) void {
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+            const stream = state.*.stream;
+
+            const allocator = ctx.*.allocator.*;
+            const write_req_pool = ctx.*.write_req_allocator;
+
+            const response_text = response.*.to_string(allocator) catch {
+                logger.err("Failed to write response", .{});
+                return;
+            };
+            if (response_text.in_heap) {
+                defer allocator.free(response_text.string);
+            }
+
+            const write_req = write_req_pool.create() catch {
+                logger.err("Failed to allocate write_req", .{});
+                return;
+            };
+
+            var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
+            _ = uv.uv_write(
+                write_req,
+                stream,
+                &buf_resp,
+                1,
+                on_write_cb,
+            );
+        }
+
         fn after_process(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
             const baton: *Baton = @ptrCast(@alignCast(req.*.data));
             const stream = baton.*.stream;
@@ -186,8 +216,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
 
-            const allocator = ctx.*.allocator.*;
-            var write_req_pool = ctx.*.write_req_allocator;
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
             const baton_pool = ctx.*.baton_allocator;
@@ -214,27 +242,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 state.*.is_idle = true;
             }
 
-            const response_text = response.*.to_string(allocator) catch {
-                logger.err("Failed to write response", .{});
-                return;
-            };
-            if (response_text.in_heap) {
-                defer allocator.free(response_text.string);
-            }
-
-            const write_req = write_req_pool.create() catch {
-                logger.err("Failed to allocate write_req", .{});
-                return;
-            };
-
-            var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
-            _ = uv.uv_write(
-                write_req,
-                stream,
-                &buf_resp,
-                1,
-                on_write_cb,
-            );
+            send_response(response, state, on_write_cb);
         }
 
         fn process(req: [*c]uv.uv_work_t) callconv(.c) void {
@@ -456,7 +464,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
             const arena_pool = ctx.*.arena_allocator;
-            const write_req_pool = ctx.*.write_req_allocator;
 
             const stream = state.*.stream;
 
@@ -481,27 +488,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     };
                 }
 
-                const response_text = response_struct.response.*.to_string(allocator) catch {
-                    logger.err("Failed to write response", .{});
-                    return;
-                };
-                if (response_text.in_heap) {
-                    defer allocator.free(response_text.string);
-                }
-
-                const write_req = write_req_pool.create() catch {
-                    logger.err("Failed to allocate write_req", .{});
-                    return;
-                };
-
-                var buf_resp = uv.uv_buf_init(@ptrCast(@constCast(response_text.string)), @intCast(response_text.string.len));
-                _ = uv.uv_write(
-                    write_req,
-                    stream,
-                    &buf_resp,
-                    1,
-                    on_write_complete_no_keep_alive,
-                );
+                send_response(response_struct.response, state, on_write_complete_no_keep_alive);
             }
         }
 
