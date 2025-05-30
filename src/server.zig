@@ -604,7 +604,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
 const testing = std.testing;
 
-test "should start and stop" {
+test "testing server" {
     const azig = Server(void, void);
     const Request = request_t(void);
 
@@ -613,7 +613,24 @@ test "should start and stop" {
     defer _ = gpa.deinit();
 
     const on_response = struct {
-        fn on_response(_: *Request, _: *Response) !void {}
+        fn on_response(request: *Request, response: *Response) !void {
+            if (std.mem.eql(u8, request.path, "/")) {
+                response.*.body = "Home Page";
+                try response.*.addHeader("Content-Type", "text/plain");
+            } else if (std.mem.eql(u8, request.path, "/error")) {
+                response.*.set_error_response();
+            } else if (std.mem.eql(u8, request.path, "/bad-request")) {
+                response.*.set_bad_request_response();
+            } else if (std.mem.eql(u8, request.path, "/timeout")) {
+                response.*.set_timeout_response();
+            } else if (std.mem.eql(u8, request.path, "/custom-status")) {
+                response.*.status_code = 201;
+                response.*.body = "Created";
+            } else {
+                response.*.status_code = 404;
+                response.*.body = "Not Found";
+            }
+        }
     }.on_response;
 
     const run = struct {
@@ -635,14 +652,81 @@ test "should start and stop" {
 
     var buf: [4096]u8 = undefined;
 
-    const uri = try std.Uri.parse("http://localhost:2500");
+    // Basic GET request to root path
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.ok);
 
-    var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
-    defer req.deinit();
+        const body = try req.reader().readAllAlloc(allocator, 1024);
+        defer allocator.free(body);
+        try testing.expectEqualStrings("Home Page", body);
+    }
 
-    try req.send();
-    try req.finish();
-    try req.wait();
+    // GET request to error endpoint
+    {
+        const uri = try std.Uri.parse("http://localhost:2500/error");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.internal_server_error);
+    }
 
-    try testing.expectEqual(req.response.status, std.http.Status.ok);
+    // GET request to bad-request endpoint
+    {
+        const uri = try std.Uri.parse("http://localhost:2500/bad-request");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.bad_request);
+    }
+
+    // GET request to timeout endpoint
+    {
+        const uri = try std.Uri.parse("http://localhost:2500/timeout");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.request_timeout);
+    }
+
+    // GET request to custom status endpoint
+    {
+        const uri = try std.Uri.parse("http://localhost:2500/custom-status");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.created);
+
+        const body = try req.reader().readAllAlloc(allocator, 1024);
+        defer allocator.free(body);
+        try testing.expectEqualStrings("Created", body);
+    }
+
+    // GET request to non-existent path
+    {
+        const uri = try std.Uri.parse("http://localhost:2500/not-found");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.not_found);
+
+        const body = try req.reader().readAllAlloc(allocator, 1024);
+        defer allocator.free(body);
+        try testing.expectEqualStrings("Not Found", body);
+    }
 }
