@@ -130,6 +130,12 @@ pub const Response = struct {
         self.*.status_code = 400;
     }
 
+    pub fn set_timeout_response(self: *Self) void {
+        self.*.headers.clearRetainingCapacity();
+        self.*.body = null;
+        self.*.status_code = 408;
+    }
+
     fn statusCodeToString(code: u16) ?[]const u8 {
         return switch (code) {
             200 => "OK",
@@ -139,6 +145,7 @@ pub const Response = struct {
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            408 => "Request Timeout",
             500 => "Internal Server Error",
             else => null,
         };

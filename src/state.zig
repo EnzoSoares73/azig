@@ -5,4 +5,5 @@ pub const State = struct {
     timer: uv.uv_timer_t,
     stream: [*c]uv.uv_stream_t,
     request_raw: ?[]u8,
+    is_idle: bool,
 };
