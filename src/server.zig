@@ -129,6 +129,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         pub fn stop(self: *Self) void {
             uv.uv_stop(self.*.loop);
 
+            uv.uv_walk(self.*.loop, struct {
+                fn cb(handle: [*c]uv.uv_handle_t, _: ?*anyopaque) callconv(.c) void {
+                    uv.uv_close(handle, null);
+                }
+            }.cb, null);
+
             _ = uv.uv_loop_close(self.loop);
             logger.info("Server stopped", .{});
         }
@@ -329,6 +335,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 if (nread != uv.UV_EOF) {
                     logger.err("Read error: {s}", .{uv.uv_strerror(@intCast(nread))});
                 }
+                if (state.*.request_raw) |request_raw| {
+                    ctx.*.allocator.free(request_raw);
+                }
                 _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
                 return;
             }
@@ -364,6 +373,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&baton.*.req)), process, after_process);
                     if (res != 0) {
                         _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
+                        ctx.*.allocator.*.free(baton.*.request_raw);
+                        baton_pool.destroy(baton);
                     }
                 } else {
                     // if this isn't the last read call of the request, we should copy (and concatenate) the buffer
@@ -742,5 +753,71 @@ test "testing server" {
         const body = try req.reader().readAllAlloc(allocator, 1024);
         defer allocator.free(body);
         try testing.expectEqualStrings("Not Found", body);
+    }
+
+    // POST body bigger than buffer size
+    {
+        var buffer: [131072]u8 = undefined;
+        for (0..buffer.len) |i| {
+            buffer[i] = @intCast(i % 256);
+        }
+
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.POST, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        req.transfer_encoding = .chunked;
+        _ = try req.write(&buffer);
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.ok);
+    }
+}
+
+
+test "should handle mid-request timeout gracefully" {
+    const azig = Server(void, void);
+    const Request = request_t(void);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const on_response = struct {
+        fn on_response(_: *Request, _: *Response) !void {
+            std.time.sleep(200 * std.time.ns_per_ms);
+            try testing.expect(true);
+        }
+    }.on_response;
+
+    const run = struct {
+        fn run(server_ptr: *azig) !void {
+            try server_ptr.start();
+        }
+    }.run;
+
+    var server = azig.init(&allocator, Config{
+        .timeout = 100,
+    }, on_response, {});
+    const thread = try std.Thread.spawn(.{}, run, .{&server});
+
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.request_timeout);
     }
 }
