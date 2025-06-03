@@ -1,7 +1,5 @@
 const std = @import("std");
-const State = @import("state.zig").State;
 const Response = @import("response.zig").Response;
-const Baton = @import("baton.zig").Baton;
 const uv = @import("imports/libuv.zig");
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 const MapPool = @import("pools/map_pool.zig").MapPool;
@@ -44,19 +42,11 @@ pub const client_pool_t = ThreadSafeMemoryPool(uv.uv_tcp_t, .{
     .growable = true,
 });
 
-pub const baton_pool_t = ThreadSafeMemoryPool(Baton, .{
-    .growable = true,
-});
-
 pub const write_req_pool_t = ThreadSafeMemoryPool(uv.uv_write_t, .{
     .growable = true,
 });
 
 pub const arena_pool_t = ThreadSafeMemoryPool(std.heap.ArenaAllocator, .{
-    .growable = true,
-});
-
-pub const state_pool_t = ThreadSafeMemoryPool(State, .{
     .growable = true,
 });
 

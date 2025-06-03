@@ -46,16 +46,28 @@ pub fn request_t(comptime RequestContext: type) type {
                 const value = entry.value_ptr.*;
                 print("{s}: {s}\n", .{ key, value });
             }
-
-            if (self.body) |body| {
-                print("\n{s}\n", .{body});
-            }
+            //
+            // if (self.body) |body| {
+            //     print("\n{s}\n", .{body});
+            // }
 
             print("\n\n", .{});
         }
 
         pub fn getHeader(self: Self, name: []const u8) ?[]const u8 {
             return self.headers.*.get(@constCast(name));
+        }
+
+        pub fn appendToBody(self: *Self, new_data: []const u8) void {
+            if (self.*.body) |existing_body| {
+                // If there's already a body, we just update it to include the new data
+                // This works because the caller has already appended the new data to the buffer
+                // and updated the slices to point to the new buffer
+                self.*.body = existing_body.ptr[0..existing_body.len + new_data.len];
+            } else {
+                // If there's no body yet, set it to the new data
+                self.*.body = new_data;
+            }
         }
 
         pub fn parseRequest(self: *Self, request_raw: []u8) !void {
