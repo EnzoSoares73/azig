@@ -330,6 +330,63 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             return new_buffer[offset..offset + old_slice.len];
         }
 
+        // When the request is too big for a single buffer, we copy the bytes already received
+        // together with the new bytes into a new buffer.
+        // This method recreates the slices so that they point to the new valid buffer
+        fn transfer_buffer_slices(state: *State, old_buffer: []u8, new_buffer: []u8) void {
+            state.*.request.*.method = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.method), new_buffer);
+            state.*.request.*.path = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.path), new_buffer);
+            state.*.request.*.version = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.version), new_buffer);
+            if (state.*.request.*.body) |body| {
+                 state.*.request.*.body = transfer_buffer_slice(old_buffer, @constCast(body), new_buffer);
+            }
+
+            var header_iter = state.*.request.*.headers.*.iterator();
+            while (header_iter.next()) |entry| {
+                const value = entry.value_ptr.*;
+                entry.value_ptr.* = transfer_buffer_slice(old_buffer, @constCast(value), new_buffer);
+
+                const key = entry.key_ptr.*;
+                entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
+            }
+
+            var param_iter = state.*.request.*.params.*.iterator();
+            while (param_iter.next()) |entry| {
+                const value = entry.value_ptr.*;
+                entry.value_ptr.* = transfer_buffer_slice(old_buffer, @constCast(value), new_buffer);
+
+                const key = entry.key_ptr.*;
+                entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
+            }
+        }
+
+
+        fn is_finished_reading(request: *Request) !bool {
+            const content_length_header = request.*.getHeader("Content-Length");
+            if (content_length_header) |header| {
+                const content_length = try std.fmt.parseInt(u64, header, 10);
+                if (request.*.body) |body| {
+                    if (content_length == body.len) {
+                        return true;
+                    } else if (content_length < body.len) {
+                        return error.BadRequest;
+                    } else {
+                        return false;
+                    }
+                } else if (content_length == 0 and request.*.body == null) {
+                    return true;
+                } else {
+                    return false;
+                }
+            } else {
+                if (request.*.body == null) {
+                    return true;
+                } else {
+                    return error.BadRequest;
+                }
+            }
+        }
+
         fn on_read(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
             const state: *State = @ptrCast(@alignCast(stream.*.data));
@@ -368,30 +425,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ) catch {
                         return;
                     };
-                    state.*.request.*.method = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.method), new_buffer);
-                    state.*.request.*.path = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.path), new_buffer);
-                    state.*.request.*.version = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.version), new_buffer);
-                    if (state.*.request.*.body) |body| {
-                         state.*.request.*.body = transfer_buffer_slice(old_buffer, @constCast(body), new_buffer);
-                    }
 
-                    var header_iter = state.*.request.*.headers.*.iterator();
-                    while (header_iter.next()) |entry| {
-                        const value = entry.value_ptr.*;
-                        entry.value_ptr.* = transfer_buffer_slice(old_buffer, @constCast(value), new_buffer);
-
-                        const key = entry.key_ptr.*;
-                        entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
-                    }
-
-                    var param_iter = state.*.request.*.params.*.iterator();
-                    while (param_iter.next()) |entry| {
-                        const value = entry.value_ptr.*;
-                        entry.value_ptr.* = transfer_buffer_slice(old_buffer, @constCast(value), new_buffer);
-
-                        const key = entry.key_ptr.*;
-                        entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
-                    }
+                    transfer_buffer_slices(state, old_buffer, new_buffer);
 
                     // since we now the first buffer must contain the headers,
                     // the following buffers will contain only the body, or parts of it
@@ -422,36 +457,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     state.*.request = request_struct.request;
                     state.*.cleanup_request_cb = request_struct.cleanup;
                 }
-                const content_length_header = state.*.request.*.getHeader("Content-Length");
-                if (content_length_header) |header| {
-                    const content_length = std.fmt.parseInt(u64, header,10) catch {
-                        return;
-                    };
-                    if (state.*.request.*.body) |body| {
-                        if (content_length == body.len) {
-                            const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&state.*.req)), process, after_process);
-                            if (res != 0) {
-                                _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
-                            }
-                        } else if (content_length < body.len) {
-                            set_response_and_send(state, Response.set_bad_request_response);
-                            _ = uv.uv_read_stop(state.*.stream);
-                        }
-                    } else if (content_length == 0 and state.*.request.*.body == null) {
-                        const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&state.*.req)), process, after_process);
-                        if (res != 0) {
-                            _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
-                        }
-                    }
-                } else {
-                    if (state.*.request.*.body == null) {
-                        const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&state.*.req)), process, after_process);
-                        if (res != 0) {
-                            _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
-                        }
-                    } else {
-                        set_response_and_send(state, Response.set_bad_request_response);
-                        _ = uv.uv_read_stop(state.*.stream);
+
+                const has_finished_reading = is_finished_reading(state.*.request) catch {
+                    set_response_and_send(state, Response.set_bad_request_response);
+                    _ = uv.uv_read_stop(state.*.stream);
+                    return;
+                };
+                if (has_finished_reading) {
+                    const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&state.*.req)), process, after_process);
+                    if (res != 0) {
+                        _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
                     }
                 }
             } else {
@@ -843,6 +858,17 @@ test "testing server" {
         req.transfer_encoding = .{ .content_length = 131072 };
         try req.send();
         _ = try req.write(&buffer);
+        try req.finish();
+        try req.wait();
+    }
+
+    // POST explicit content-length = 0 and no body
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.POST, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        req.transfer_encoding = .{ .content_length = 0 };
+        try req.send();
         try req.finish();
         try req.wait();
     }

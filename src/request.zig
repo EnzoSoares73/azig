@@ -46,10 +46,10 @@ pub fn request_t(comptime RequestContext: type) type {
                 const value = entry.value_ptr.*;
                 print("{s}: {s}\n", .{ key, value });
             }
-            //
-            // if (self.body) |body| {
-            //     print("\n{s}\n", .{body});
-            // }
+
+            if (self.body) |body| {
+                print("\n{s}\n", .{body});
+            }
 
             print("\n\n", .{});
         }
