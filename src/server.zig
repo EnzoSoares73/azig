@@ -148,8 +148,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 }
             }.cb, null);
 
-            _ = uv.uv_loop_close(self.loop);
-            logger.info("Server stopped", .{});
+            const status = uv.uv_loop_close(self.loop);
+            if (status != 0) {
+                logger.err("Error: {s}", .{uv.uv_strerror(status)});
+            } else {
+                logger.info("Server stopped", .{});
+            }
         }
 
         pub fn register_middleware(self: *Self, middleware_list: []const middleware) void {
@@ -202,6 +206,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 _ = uv.uv_timer_start(&state.*.timer, on_timeout, ctx.*.timeout, 0);
                 _ = uv.uv_read_start(stream, alloc_buffer, on_read);
             } else {
+                logger.info("Connection refused", .{});
                 _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
             }
         }
@@ -258,11 +263,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     logger.err("Failed to deinit response", .{});
                 };
                 arena_pool.destroy(arena);
-                if (state.*.request_raw) |request_raw| {
-                    ctx.*.allocator.free(request_raw);
-                } else {
-                    unreachable;
-                }
             }
 
             if (status < 0) {
@@ -273,6 +273,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             if (uv.uv_is_active(handle) != 0) {
                 send_response(response, state, on_write_cb);
+                if (state.*.request_raw) |request_raw| {
+                    ctx.*.allocator.*.free(request_raw);
+                }
             } else {
                 on_close(handle);
             }
@@ -290,7 +293,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 logger.err("Failed to deinit request", .{});
             };
 
-            const response_struct = create_response(ctx) catch {
+            const response_struct = create_response(ctx) catch |err| {
+                logger.err("Error creating response: {}", .{err});
                 return;
             };
             const response = response_struct.response;
@@ -305,8 +309,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
 
             handle_callback(ctx, request, response);
-
-            state.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
         }
 
         fn handle_callback(ctx: *Context, request: *Request, response: *Response) void {
@@ -408,6 +410,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
 
             if (buf.*.base == null) {
+                logger.info("Closing connection", .{});
                 _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
                 return;
             }
@@ -422,7 +425,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                         ctx.*.allocator.*,
                         old_buffer,
                         buf.*.base[0..new_read],
-                    ) catch {
+                    ) catch |err| {
+                        logger.err("There was an error appending buffers: {}", .{err});
                         return;
                     };
 
@@ -447,7 +451,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                     // The headers of the request must be included in the first buffer.
                     request.*.parseRequest(request_raw) catch |err| {
-                        logger.info("{}", .{err});
+                        logger.err("{}", .{err});
                         set_response_and_send(state, Response.set_bad_request_response);
                         _ = uv.uv_read_stop(state.*.stream);
                         return;
@@ -456,6 +460,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     state.*.request_raw = request_raw;
                     state.*.request = request_struct.request;
                     state.*.cleanup_request_cb = request_struct.cleanup;
+                    state.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
                 }
 
                 const has_finished_reading = is_finished_reading(state.*.request) catch {
@@ -478,7 +483,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     uv.UV_ECONNRESET, uv.UV_ECONNABORTED => {
                         _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
                         if (state.*.request_raw) |request_raw| {
-                            ctx.*.allocator.free(request_raw);
+                            ctx.*.allocator.*.free(request_raw);
                         }
                     }, else => {
 
@@ -580,7 +585,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const map_pool = ctx.*.map_allocator;
             const arena_pool = ctx.*.arena_allocator;
 
-            const response_struct = create_response(ctx) catch {
+            const response_struct = create_response(ctx) catch |err| {
+                logger.err("Error creating response: {}", .{err});
                 return;
             };
             if (set_response_fn) |function| {
@@ -651,7 +657,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             var buffer_pool = ctx.*.buffer_allocator;
 
-            const memory: *[suggested_buffer_size]u8 = buffer_pool.create() catch {
+            const memory: *[suggested_buffer_size]u8 = buffer_pool.create() catch |err| {
+                logger.err("Error creating buffer: {}", .{err});
                 buf.* = uv.uv_buf_init(null, 0);
                 return;
             };
@@ -886,7 +893,6 @@ test "should handle mid-request timeout gracefully" {
     const on_response = struct {
         fn on_response(_: *Request, _: *Response) !void {
             std.time.sleep(200 * std.time.ns_per_ms);
-            try testing.expect(true);
         }
     }.on_response;
 
