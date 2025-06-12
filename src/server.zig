@@ -122,7 +122,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return error.LoopInitFailed;
             }
 
-            self.loop = &loop;
+            self.*.loop = &loop;
 
             var server: uv.uv_tcp_t = undefined;
             _ = uv.uv_tcp_init(&loop, &server);
@@ -140,6 +140,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         pub fn stop(self: *Self) void {
+            // To stop the server, we must:
+            // 1. Stop the loop
+            // 2. Iterate over the open handles and close them
+            // 3. How the loop again so the async operations can be terminated
+            // 4. Close the loop
+
             uv.uv_stop(self.*.loop);
 
             uv.uv_walk(self.*.loop, struct {
@@ -147,6 +153,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     uv.uv_close(handle, null);
                 }
             }.cb, null);
+
+            const result = uv.uv_loop_init(self.*.loop);
+            if (result < 0) {
+                logger.err("Error: {s}", .{uv.uv_strerror(result)});
+            }
+
+            _ = uv.uv_run(self.*.loop, uv.UV_RUN_DEFAULT);
 
             const status = uv.uv_loop_close(self.loop);
             if (status != 0) {
@@ -156,7 +169,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
-        pub fn register_middleware(self: *Self, middleware_list: []const middleware) void {
+        pub fn register_middlewares(self: *Self, middleware_list: []const middleware) void {
             self.middleware_list = middleware_list;
         }
 
@@ -267,7 +280,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             if (status < 0) {
                 logger.info("Operation cancelled", .{});
-                on_close(handle);
+                if (uv.uv_is_active(handle) != 0) {
+                    _ = uv.uv_close(handle, on_close);
+                }
                 return;
             }
 
@@ -277,7 +292,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx.*.allocator.*.free(request_raw);
                 }
             } else {
-                on_close(handle);
+                // if the request timed out, then it is not possible to
+                // write anything to the stream, nor is it needed to free the memory
             }
         }
 
@@ -881,7 +897,6 @@ test "testing server" {
     }
 }
 
-
 test "should handle mid-request timeout gracefully" {
     const azig = Server(void, void);
     const Request = request_t(void);
@@ -908,6 +923,7 @@ test "should handle mid-request timeout gracefully" {
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
+        std.time.sleep(1_000 * std.time.ns_per_ms);
         server.stop();
         thread.join();
     }
@@ -925,5 +941,84 @@ test "should handle mid-request timeout gracefully" {
         try req.finish();
         try req.wait();
         try testing.expectEqual(req.response.status, std.http.Status.request_timeout);
+    }
+}
+
+test "should call middlewares in order" {
+    const RequestContext = struct {
+      counter: u8,
+    };
+    const azig = Server(void, RequestContext);
+    const Request = request_t(RequestContext);
+    const Action = action_t(void, RequestContext);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const on_response = struct {
+        fn on_response(request: *Request, _: *Response) !void {
+            try testing.expectEqual(request.context.counter, 3);
+            request.context.counter = 4;
+        }
+    }.on_response;
+
+    const mid1 = struct {
+        fn mid(request: *Request, _: *Response, action: Action) !void {
+            request.context.counter = 1;
+            try action.next();
+            try testing.expectEqual(request.context.counter, 6);
+            request.context.counter = 7;
+        }
+    }.mid;
+
+    const mid2 = struct {
+        fn mid(request: *Request, _: *Response, action: Action) !void {
+            try testing.expectEqual(request.context.counter, 1);
+            request.context.counter = 2;
+            try action.next();
+            try testing.expectEqual(request.context.counter, 5);
+            request.context.counter = 6;
+        }
+    }.mid;
+
+    const mid3 = struct {
+        fn mid(request: *Request, _: *Response, action: Action) !void {
+            try testing.expectEqual(request.context.counter, 2);
+            request.context.counter = 3;
+            try action.next();
+            try testing.expectEqual(request.context.counter, 4);
+            request.context.counter = 5;
+        }
+    }.mid;
+
+    const run = struct {
+        fn run(server_ptr: *azig) !void {
+            try server_ptr.start();
+        }
+    }.run;
+
+    var server = azig.init(&allocator, Config{}, on_response, {});
+    server.register_middlewares(&.{mid1, mid2, mid3});
+    const thread = try std.Thread.spawn(.{}, run, .{&server});
+
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.ok);
     }
 }
