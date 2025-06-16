@@ -1,6 +1,7 @@
 /// Represents a HTTP server implementation using libuv
 const std = @import("std");
 const mem = std.mem;
+const atomic = std.atomic;
 const uv = @import("imports/libuv.zig");
 const Config = @import("config.zig").Config;
 const request_t = @import("request.zig").request_t;
@@ -33,7 +34,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         timer: uv.uv_timer_t,
         stream: [*c]uv.uv_stream_t,
         request_raw: ?[]u8,
-        is_idle: bool,
+        reference_count: atomic.Value(u8),
         req: uv.uv_work_t,
         response: *Response,
         request: *Request,
@@ -200,7 +201,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .stream = stream,
                 .request = undefined,
                 .response = undefined,
-                .is_idle = true,
+                .reference_count = atomic.Value(u8).init(0),
                 .req = undefined,
                 .cleanup_response_cb = undefined,
                 .cleanup_request_cb = undefined,
@@ -268,8 +269,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const on_write_cb = state.*.on_write_cb;
             const cleanup_response_cb = state.*.cleanup_response_cb;
 
-            state.*.is_idle = true;
-
             defer {
                 const arena = response.*.arena;
                 cleanup_response_cb(response, map_pool, response_pool) catch {
@@ -292,8 +291,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx.*.allocator.*.free(request_raw);
                 }
             } else {
-                // if the request timed out, then it is not possible to
-                // write anything to the stream, nor is it needed to free the memory
+                on_close(handle);
             }
         }
 
@@ -303,6 +301,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const request_pool = ctx.*.request_allocator;
             const map_pool = ctx.*.map_allocator;
+
+            _ = state.*.reference_count.fetchAdd(1, .seq_cst);
 
             const request = state.*.request;
             defer state.*.cleanup_request_cb(request, map_pool, request_pool) catch {
@@ -411,7 +411,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             _ = uv.uv_timer_start(&state.*.timer, on_timeout, ctx.*.timeout, 0);
-            state.*.is_idle = false;
             state.*.req.data = @ptrCast(@alignCast(state));
             state.*.stream = stream;
 
@@ -453,7 +452,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     state.*.request.*.appendToBody(new_buffer[old_buffer.len..]);
                     state.*.request_raw = new_buffer;
                 } else {
-                    // First time on_read is being called for this request
+                    // First time on_read being called for this request
                     const request_raw = ctx.*.allocator.*.dupe(u8, buf.*.base[0..new_read]) catch {
                         logger.err("Failed to duplicate data", .{});
                         return;
@@ -491,18 +490,17 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     }
                 }
             } else {
+                _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
+                if (state.*.request_raw) |request_raw| {
+                    ctx.*.allocator.*.free(request_raw);
+                }
                 switch (nread) {
-                    // There is no more data to be read
+                // There is no more data to be read
                     uv.UV_EOF => {
-                        _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
-                    },
-                    uv.UV_ECONNRESET, uv.UV_ECONNABORTED => {
-                        _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
-                        if (state.*.request_raw) |request_raw| {
-                            ctx.*.allocator.*.free(request_raw);
-                        }
-                    }, else => {
 
+                    },
+                    else => {
+                        logger.err("Read error: {s}", .{uv.uv_strerror(@intCast(nread))});
                     }
                 }
             }
@@ -631,9 +629,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 ctx.*.allocator.free(request_raw);
             }
 
-            if (state.*.is_idle) {
+            if (state.*.reference_count.load(.seq_cst) == 0) {
                 _ = uv.uv_close(@ptrCast(stream), on_close);
             } else {
+                _ = state.*.reference_count.fetchAdd(1, .seq_cst);
                 set_response_and_send(state, Response.set_timeout_response);
             }
         }
@@ -643,8 +642,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             _ = uv.uv_timer_stop(&state.*.timer);
+            _ = state.*.reference_count.fetchSub(1, .seq_cst);
 
-            if (state.*.is_idle) {
+            if (state.*.reference_count.load(.seq_cst) == 0) {
                 logger.info("Connection closed", .{});
                 const client_pool = ctx.client_allocator;
                 const client: *uv.uv_tcp_t = @ptrCast(@alignCast(handle));
@@ -777,10 +777,13 @@ test "testing server" {
         }
     }.run;
 
-    var server = azig.init(&allocator, Config{}, on_response, {});
+    var server = azig.init(&allocator, Config{
+        .timeout = 500
+    }, on_response, {});
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
+        std.time.sleep(1_000 * std.time.ns_per_ms);
         server.stop();
         thread.join();
     }
@@ -883,6 +886,7 @@ test "testing server" {
         _ = try req.write(&buffer);
         try req.finish();
         try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.ok);
     }
 
     // POST explicit content-length = 0 and no body
@@ -894,6 +898,19 @@ test "testing server" {
         try req.send();
         try req.finish();
         try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.ok);
+    }
+
+    // POST content-length > 0 and stop sending data mid_request
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.POST, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        req.transfer_encoding = .{ .content_length = 100 };
+        try req.send();
+        req.finish() catch |err| {
+            try testing.expectEqual(err, error.MessageNotCompleted);
+        };
     }
 }
 
@@ -908,6 +925,53 @@ test "should handle mid-request timeout gracefully" {
     const on_response = struct {
         fn on_response(_: *Request, _: *Response) !void {
             std.time.sleep(200 * std.time.ns_per_ms);
+        }
+    }.on_response;
+
+    const run = struct {
+        fn run(server_ptr: *azig) !void {
+            try server_ptr.start();
+        }
+    }.run;
+
+    var server = azig.init(&allocator, Config{
+        .timeout = 100,
+    }, on_response, {});
+    const thread = try std.Thread.spawn(.{}, run, .{&server});
+
+    defer {
+        std.time.sleep(1_000 * std.time.ns_per_ms);
+        server.stop();
+        thread.join();
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        try req.send();
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.request_timeout);
+    }
+}
+
+test "should handle mid-request timeout gracefully, where after_process is called BEFORE the on_close callback from the timeout" {
+    const azig = Server(void, void);
+    const Request = request_t(void);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const on_response = struct {
+        fn on_response(_: *Request, _: *Response) !void {
+            std.time.sleep(100 * std.time.ns_per_ms);
         }
     }.on_response;
 

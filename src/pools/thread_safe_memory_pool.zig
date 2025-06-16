@@ -23,6 +23,7 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         arena: std.heap.ArenaAllocator,
         free_list: ?NodePtr = null,
         mutex: std.Thread.Mutex,
+        var count: u16 = 0;
 
         pub fn init(allocator: std.mem.Allocator) Pool {
             return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = Mutex{} };
@@ -91,7 +92,6 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         pub fn destroy(pool: *Pool, ptr: ItemPtr) void {
             pool.*.mutex.lock();
             defer pool.*.mutex.unlock();
-            ptr.* = undefined;
 
             const node = @as(NodePtr, @ptrCast(ptr));
 
