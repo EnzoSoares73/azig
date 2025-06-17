@@ -38,8 +38,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         req: uv.uv_work_t,
         response: *Response,
         request: *Request,
-        cleanup_response_cb: *const fn (*Response, *map_t, *response_pool_t) anyerror!void,
-        cleanup_request_cb: *const fn (*Request, *map_t, *request_pool_t) anyerror!void,
         on_write_cb: *const fn([*c]uv.uv_write_t, c_int) callconv(.c) void,
     };
 
@@ -69,10 +67,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         middleware_list: []const middleware,
         timeout: u64,
     };
-
-    const init_request_t = struct { request: *Request, cleanup: *const fn (*Request, *map_t, *request_pool_t) anyerror!void };
-
-    const init_response_t = struct { response: *Response, cleanup: *const fn (*Response, *map_t, *response_pool_t) anyerror!void };
 
     return struct {
         allocator: *mem.Allocator,
@@ -203,8 +197,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .response = undefined,
                 .reference_count = atomic.Value(u8).init(0),
                 .req = undefined,
-                .cleanup_response_cb = undefined,
-                .cleanup_request_cb = undefined,
                 .on_write_cb = undefined,
                 .request_raw = null,
             };
@@ -267,13 +259,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const response = state.*.response;
             const on_write_cb = state.*.on_write_cb;
-            const cleanup_response_cb = state.*.cleanup_response_cb;
 
             defer {
                 const arena = response.*.arena;
-                cleanup_response_cb(response, map_pool, response_pool) catch {
+                response.arena.*.deinit();
+                response.*.deinit(map_pool) catch {
                     logger.err("Failed to deinit response", .{});
                 };
+                response_pool.*.destroy(response);
                 arena_pool.destroy(arena);
             }
 
@@ -305,18 +298,19 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = state.*.reference_count.fetchAdd(1, .seq_cst);
 
             const request = state.*.request;
-            defer state.*.cleanup_request_cb(request, map_pool, request_pool) catch {
-                logger.err("Failed to deinit request", .{});
-            };
+            defer {
+                request.*.deinit(map_pool) catch {
+                    logger.err("Failed to deinit request", .{});
+                };
+                request_pool.destroy(request);
+            }
 
-            const response_struct = create_response(ctx) catch |err| {
+            const response = create_response(ctx) catch |err| {
                 logger.err("Error creating response: {}", .{err});
                 return;
             };
-            const response = response_struct.response;
 
             state.*.response = response;
-            state.*.cleanup_response_cb = response_struct.cleanup;
 
             if (state.*.request_raw) |request_raw| {
                 logger.info("{s}", .{request_raw});
@@ -359,17 +353,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                  state.*.request.*.body = transfer_buffer_slice(old_buffer, @constCast(body), new_buffer);
             }
 
-            var header_iter = state.*.request.*.headers.*.iterator();
-            while (header_iter.next()) |entry| {
-                const value = entry.value_ptr.*;
-                entry.value_ptr.* = transfer_buffer_slice(old_buffer, @constCast(value), new_buffer);
+            transfer_map(state.request.headers, old_buffer, new_buffer);
+            transfer_map(state.request.params, old_buffer, new_buffer);
+        }
 
-                const key = entry.key_ptr.*;
-                entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
-            }
-
-            var param_iter = state.*.request.*.params.*.iterator();
-            while (param_iter.next()) |entry| {
+        fn transfer_map(map: *std.StringHashMap([]const u8), old_buffer: []u8, new_buffer: []u8) void {
+            var iter = map.iterator();
+            while (iter.next()) |entry| {
                 const value = entry.value_ptr.*;
                 entry.value_ptr.* = transfer_buffer_slice(old_buffer, @constCast(value), new_buffer);
 
@@ -377,6 +367,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
             }
         }
+
 
 
         fn is_finished_reading(request: *Request) !bool {
@@ -458,11 +449,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                         return;
                     };
 
-                    const request_struct = start_request(map_pool, request_pool) catch |err| {
+                    const request = start_request(map_pool, request_pool) catch |err| {
                         logger.err("There was an error initializing the request: {}", .{err});
                         return;
                     };
-                    const request = request_struct.request;
 
                     // The headers of the request must be included in the first buffer.
                     request.*.parseRequest(request_raw) catch |err| {
@@ -473,8 +463,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     };
 
                     state.*.request_raw = request_raw;
-                    state.*.request = request_struct.request;
-                    state.*.cleanup_request_cb = request_struct.cleanup;
+                    state.*.request = request;
                     state.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
                 }
 
@@ -548,31 +537,19 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_close(@ptrCast(req.*.handle), on_close);
         }
 
-        fn start_request(map_pool: *map_t, request_pool: *request_pool_t) !init_request_t {
+        fn start_request(map_pool: *map_t, request_pool: *request_pool_t) !*Request {
             const request = try request_pool.create();
             request.* = try Request.init(map_pool);
-
-            return init_request_t{ .request = request, .cleanup = struct {
-                fn clean(inner_request: *Request, inner_map_pool: *map_t, inner_request_pool: *request_pool_t) !void {
-                    try inner_request.*.deinit(inner_map_pool);
-                    inner_request_pool.destroy(inner_request);
-                }
-            }.clean };
+            return request;
         }
 
-        fn start_response(arena: *std.heap.ArenaAllocator, map_pool: *map_t, response_pool: *response_pool_t) !init_response_t {
+        fn start_response(arena: *std.heap.ArenaAllocator, map_pool: *map_t, response_pool: *response_pool_t) !*Response {
             const response = try response_pool.create();
             response.* = try Response.init(arena, map_pool);
-            return init_response_t{ .response = response, .cleanup = struct {
-                fn clean(inner_response: *Response, inner_map_pool: *map_t, inner_response_pool: *response_pool_t) !void {
-                    inner_response.arena.*.deinit();
-                    try inner_response.*.deinit(inner_map_pool);
-                    inner_response_pool.destroy(inner_response);
-                }
-            }.clean };
+            return response;
         }
 
-        fn create_response(ctx: *Context) !init_response_t {
+        fn create_response(ctx: *Context) !*Response {
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
             const arena_pool = ctx.*.arena_allocator;
@@ -584,12 +561,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             };
             arena.* = std.heap.ArenaAllocator.init(allocator);
 
-            const response_struct = start_response(arena, map_pool, response_pool) catch {
+            return start_response(arena, map_pool, response_pool) catch {
                 logger.err("There was an error initializing the response", .{});
                 return error.ResponseInitFailed;
             };
-
-            return response_struct;
         }
 
         fn set_response_and_send(state: *State, set_response_fn: ?*const fn(*Response) void) void {
@@ -599,22 +574,24 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const map_pool = ctx.*.map_allocator;
             const arena_pool = ctx.*.arena_allocator;
 
-            const response_struct = create_response(ctx) catch |err| {
+            const response = create_response(ctx) catch |err| {
                 logger.err("Error creating response: {}", .{err});
                 return;
             };
             if (set_response_fn) |function| {
-                function(response_struct.response);
+                function(response);
             }
             defer {
-                const arena = response_struct.response.*.arena;
-                response_struct.cleanup(response_struct.response, map_pool, response_pool) catch {
+                const arena = response.*.arena;
+                response.arena.*.deinit();
+                response.*.deinit(map_pool) catch {
                     logger.err("Failed to deinit response", .{});
                 };
+                response_pool.*.destroy(response);
                 arena_pool.destroy(arena);
             }
 
-            send_response(response_struct.response, state, on_write_complete_no_keep_alive);
+            send_response(response, state, on_write_complete_no_keep_alive);
         }
 
         fn on_timeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
