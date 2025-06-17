@@ -993,8 +993,7 @@ test "should enforce max_payload_size limit" {
     defer _ = gpa.deinit();
 
     const on_response = struct {
-        fn on_response(request: *Request, response: *Response) !void {
-            response.*.body = request.body orelse "";
+        fn on_response(_: *Request, _: *Response) !void {
         }
     }.on_response;
 
@@ -1004,8 +1003,7 @@ test "should enforce max_payload_size limit" {
         }
     }.run;
 
-    // Set a small max_payload_size for testing (10 KB)
-    const max_payload_size: u64 = 10 * 1024;
+    const max_payload_size: u64 = comptime std.math.pow(u64, 2, 17);
     var server = azig.init(&allocator, Config{
         .max_payload_size = max_payload_size,
     }, on_response, {});
@@ -1022,13 +1020,12 @@ test "should enforce max_payload_size limit" {
 
     var buf: [4096]u8 = undefined;
 
-    // Test with payload over the limit (15 KB)
     {
         const uri = try std.Uri.parse("http://localhost:2500");
         var req = try client.open(.POST, uri, .{ .server_header_buffer = &buf });
         defer req.deinit();
 
-        var buffer: [15 * 1024]u8 = undefined;
+        var buffer: [std.math.pow(u64, 2, 18)]u8 = undefined;
         for (0..buffer.len) |i| {
             buffer[i] = @intCast(i % 256);
         }
