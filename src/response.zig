@@ -130,6 +130,12 @@ pub const Response = struct {
         self.*.status_code = 400;
     }
 
+    pub fn set_payload_too_large_response(self: *Self) void {
+        self.*.headers.clearRetainingCapacity();
+        self.*.body = null;
+        self.*.status_code = 413;
+    }
+
     pub fn set_timeout_response(self: *Self) void {
         self.*.headers.clearRetainingCapacity();
         self.*.body = null;
@@ -146,6 +152,7 @@ pub const Response = struct {
             403 => "Forbidden",
             404 => "Not Found",
             408 => "Request Timeout",
+            413 => "Payload too Large",
             500 => "Internal Server Error",
             else => null,
         };

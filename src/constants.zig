@@ -11,6 +11,7 @@ pub const DEFAULT_POOL_SIZE: u16 = 1024;
 pub const DEFAULT_INACTIVITY_TIMEOUT: u64 = 15_000;
 pub const DEFAULT_BACKLOG_SIZE: u16 = 128;
 pub const DEFAULT_LISTEN_ADDRESS = "0.0.0.0";
+pub const DEFAULT_MAX_PAYLOAD_SIZE: u64 = 1_048_576;
 pub const suggested_buffer_size: usize = 65536;
 
 pub fn callback_t(comptime AppContext: type, comptime RequestContext: type) type {

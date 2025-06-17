@@ -66,6 +66,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         app_context: *AppContext,
         middleware_list: []const middleware,
         timeout: u64,
+        max_payload_size: u64,
     };
 
     return struct {
@@ -106,6 +107,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.app_context = app_context;
             ctx.*.middleware_list = middleware_list;
             ctx.*.timeout = config.timeout;
+            ctx.*.max_payload_size = config.max_payload_size;
 
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
@@ -399,6 +401,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 if (state.*.request_raw) |request_raw| {
                     const old_buffer = request_raw;
                     defer ctx.*.allocator.*.free(old_buffer);
+
+                    if (old_buffer.len + new_read > ctx.*.max_payload_size) {
+                        set_response_and_send(state, Response.set_payload_too_large_response);
+                        _ = uv.uv_read_stop(state.*.stream);
+                        return;
+                    }
+
                     const new_buffer = append_buffer(
                         ctx.*.allocator.*,
                         old_buffer,
@@ -972,6 +981,65 @@ test "should handle mid-request timeout gracefully, where after_process is calle
         try req.finish();
         try req.wait();
         try testing.expectEqual(req.response.status, std.http.Status.request_timeout);
+    }
+}
+
+test "should enforce max_payload_size limit" {
+    const azig = Server(void, void);
+    const Request = request_t(void);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const on_response = struct {
+        fn on_response(request: *Request, response: *Response) !void {
+            response.*.body = request.body orelse "";
+        }
+    }.on_response;
+
+    const run = struct {
+        fn run(server_ptr: *azig) !void {
+            try server_ptr.start();
+        }
+    }.run;
+
+    // Set a small max_payload_size for testing (10 KB)
+    const max_payload_size: u64 = 10 * 1024;
+    var server = azig.init(&allocator, Config{
+        .max_payload_size = max_payload_size,
+    }, on_response, {});
+    const thread = try std.Thread.spawn(.{}, run, .{&server});
+
+    defer {
+        std.time.sleep(1_000 * std.time.ns_per_ms);
+        server.stop();
+        thread.join();
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    // Test with payload over the limit (15 KB)
+    {
+        const uri = try std.Uri.parse("http://localhost:2500");
+        var req = try client.open(.POST, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+
+        var buffer: [15 * 1024]u8 = undefined;
+        for (0..buffer.len) |i| {
+            buffer[i] = @intCast(i % 256);
+        }
+
+        req.transfer_encoding = .{ .content_length = buffer.len };
+        try req.send();
+        _ = try req.write(&buffer);
+        try req.finish();
+        try req.wait();
+
+        try testing.expectEqual(req.response.status, std.http.Status.payload_too_large);
     }
 }
 

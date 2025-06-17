@@ -6,4 +6,5 @@ pub const Config = struct {
     timeout: u64 = constants.DEFAULT_INACTIVITY_TIMEOUT,
     backlog_size: u16 = constants.DEFAULT_BACKLOG_SIZE,
     listen_address: []const u8 = constants.DEFAULT_LISTEN_ADDRESS,
+    max_payload_size: u64 = constants.DEFAULT_MAX_PAYLOAD_SIZE,
 };
