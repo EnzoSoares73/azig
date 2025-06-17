@@ -72,7 +72,7 @@ test "action_t with void AppContext calls callback when no middlewares" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parseRequest(mutable_request);
+    try request.parse_request(mutable_request);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {
@@ -122,7 +122,7 @@ test "should return early if middleware does not call next()" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parseRequest(mutable_request);
+    try request.parse_request(mutable_request);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {
@@ -180,7 +180,7 @@ test "should call middlewares in order" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parseRequest(mutable_request);
+    try request.parse_request(mutable_request);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {

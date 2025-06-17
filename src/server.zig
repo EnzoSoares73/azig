@@ -38,7 +38,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         req: uv.uv_work_t,
         response: *Response,
         request: *Request,
-        on_write_cb: *const fn([*c]uv.uv_write_t, c_int) callconv(.c) void,
+        on_write_cb: *const fn ([*c]uv.uv_write_t, c_int) callconv(.c) void,
     };
 
     const state_pool_t = ThreadSafeMemoryPool(State, .{
@@ -339,7 +339,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const old_buffer_pointer = @intFromPtr(old_buffer.ptr);
             const old_slice_pointer = @intFromPtr(old_slice.ptr);
             const offset = old_slice_pointer - old_buffer_pointer;
-            return new_buffer[offset..offset + old_slice.len];
+            return new_buffer[offset .. offset + old_slice.len];
         }
 
         // When the request is too big for a single buffer, we copy the bytes already received
@@ -350,7 +350,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             state.*.request.*.path = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.path), new_buffer);
             state.*.request.*.version = transfer_buffer_slice(old_buffer, @constCast(state.*.request.*.version), new_buffer);
             if (state.*.request.*.body) |body| {
-                 state.*.request.*.body = transfer_buffer_slice(old_buffer, @constCast(body), new_buffer);
+                state.*.request.*.body = transfer_buffer_slice(old_buffer, @constCast(body), new_buffer);
             }
 
             transfer_map(state.request.headers, old_buffer, new_buffer);
@@ -365,34 +365,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                 const key = entry.key_ptr.*;
                 entry.key_ptr.* = transfer_buffer_slice(old_buffer, @constCast(key), new_buffer);
-            }
-        }
-
-
-
-        fn is_finished_reading(request: *Request) !bool {
-            const content_length_header = request.*.getHeader("Content-Length");
-            if (content_length_header) |header| {
-                const content_length = try std.fmt.parseInt(u64, header, 10);
-                if (request.*.body) |body| {
-                    if (content_length == body.len) {
-                        return true;
-                    } else if (content_length < body.len) {
-                        return error.BadRequest;
-                    } else {
-                        return false;
-                    }
-                } else if (content_length == 0 and request.*.body == null) {
-                    return true;
-                } else {
-                    return false;
-                }
-            } else {
-                if (request.*.body == null) {
-                    return true;
-                } else {
-                    return error.BadRequest;
-                }
             }
         }
 
@@ -440,7 +412,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                     // since we now the first buffer must contain the headers,
                     // the following buffers will contain only the body, or parts of it
-                    state.*.request.*.appendToBody(new_buffer[old_buffer.len..]);
+                    state.*.request.*.append_to_body(new_buffer[old_buffer.len..]);
                     state.*.request_raw = new_buffer;
                 } else {
                     // First time on_read being called for this request
@@ -455,7 +427,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     };
 
                     // The headers of the request must be included in the first buffer.
-                    request.*.parseRequest(request_raw) catch |err| {
+                    request.*.parse_request(request_raw) catch |err| {
                         logger.err("{}", .{err});
                         set_response_and_send(state, Response.set_bad_request_response);
                         _ = uv.uv_read_stop(state.*.stream);
@@ -464,15 +436,24 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                     state.*.request_raw = request_raw;
                     state.*.request = request;
-                    state.*.on_write_cb = if (is_keep_alive(request)) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
+                    state.*.on_write_cb = if (request.is_keep_alive()) on_write_complete_keep_alive else on_write_complete_no_keep_alive;
                 }
 
-                const has_finished_reading = is_finished_reading(state.*.request) catch {
+                const request = state.*.request;
+                const has_finished_reading = request.*.is_finished_reading() catch {
                     set_response_and_send(state, Response.set_bad_request_response);
                     _ = uv.uv_read_stop(state.*.stream);
                     return;
                 };
                 if (has_finished_reading) {
+                    const transfer_encoding = request.*.get_header("Transfer-Encoding");
+                    if (transfer_encoding != null and std.ascii.eqlIgnoreCase(transfer_encoding.?, "chunked")) {
+                        request.*.parse_chunked_body() catch {
+                            set_response_and_send(state, Response.set_bad_request_response);
+                            _ = uv.uv_read_stop(state.*.stream);
+                            return;
+                        };
+                    }
                     const res = uv.uv_queue_work(stream.*.loop, @ptrCast(@alignCast(&state.*.req)), process, after_process);
                     if (res != 0) {
                         _ = uv.uv_close(@ptrCast(@alignCast(stream)), on_close);
@@ -484,27 +465,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx.*.allocator.*.free(request_raw);
                 }
                 switch (nread) {
-                // There is no more data to be read
-                    uv.UV_EOF => {
-
-                    },
+                    // There is no more data to be read
+                    uv.UV_EOF => {},
                     else => {
                         logger.err("Read error: {s}", .{uv.uv_strerror(@intCast(nread))});
-                    }
+                    },
                 }
             }
-        }
-
-        fn is_keep_alive(request: *Request) bool {
-            const connection_header = request.*.getHeader("Connection");
-
-            if (connection_header) |header| {
-                if (!std.ascii.eqlIgnoreCase(header, "keep-alive")) {
-                    return false;
-                }
-            }
-
-            return true;
         }
 
         fn on_write_complete_keep_alive(req: [*c]uv.uv_write_t, status: c_int) callconv(.c) void {
@@ -567,7 +534,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             };
         }
 
-        fn set_response_and_send(state: *State, set_response_fn: ?*const fn(*Response) void) void {
+        fn set_response_and_send(state: *State, set_response_fn: ?*const fn (*Response) void) void {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             const response_pool = ctx.*.response_allocator;
@@ -741,6 +708,9 @@ test "testing server" {
             } else if (std.mem.eql(u8, request.path, "/custom-status")) {
                 response.*.status_code = 201;
                 response.*.body = "Created";
+            } else if (std.mem.eql(u8, request.path, "/chunked")) {
+                response.*.body = request.body orelse "";
+                try response.*.addHeader("Content-Type", "text/plain");
             } else {
                 response.*.status_code = 404;
                 response.*.body = "Not Found";
@@ -754,9 +724,7 @@ test "testing server" {
         }
     }.run;
 
-    var server = azig.init(&allocator, Config{
-        .timeout = 500
-    }, on_response, {});
+    var server = azig.init(&allocator, Config{ .timeout = 500 }, on_response, {});
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
@@ -889,6 +857,28 @@ test "testing server" {
             try testing.expectEqual(err, error.MessageNotCompleted);
         };
     }
+
+    // POST Transfer-Encoding: chunked
+    {
+        const uri = try std.Uri.parse("http://localhost:2500/chunked");
+        var req = try client.open(.POST, uri, .{ .server_header_buffer = &buf });
+        defer req.deinit();
+        req.transfer_encoding = .chunked;
+        try req.send();
+
+        var writer = req.writer();
+        try writer.writeAll("Hello");
+        try writer.writeAll(" World");
+        try writer.writeAll("!");
+
+        try req.finish();
+        try req.wait();
+        try testing.expectEqual(req.response.status, std.http.Status.ok);
+
+        const body = try req.reader().readAllAlloc(allocator, 1024);
+        defer allocator.free(body);
+        try testing.expectEqualStrings("Hello World!", body);
+    }
 }
 
 test "should handle mid-request timeout gracefully" {
@@ -987,7 +977,7 @@ test "should handle mid-request timeout gracefully, where after_process is calle
 
 test "should call middlewares in order" {
     const RequestContext = struct {
-      counter: u8,
+        counter: u8,
     };
     const azig = Server(void, RequestContext);
     const Request = request_t(RequestContext);
@@ -1040,7 +1030,7 @@ test "should call middlewares in order" {
     }.run;
 
     var server = azig.init(&allocator, Config{}, on_response, {});
-    server.register_middlewares(&.{mid1, mid2, mid3});
+    server.register_middlewares(&.{ mid1, mid2, mid3 });
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
