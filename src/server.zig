@@ -257,9 +257,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const response_pool = ctx.*.response_allocator;
             const map_pool = ctx.*.map_allocator;
+            const request_pool = ctx.*.request_allocator;
             const arena_pool = ctx.*.arena_allocator;
 
             const response = state.*.response;
+            const request = state.*.request;
             const on_write_cb = state.*.on_write_cb;
 
             defer {
@@ -270,6 +272,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 };
                 response_pool.*.destroy(response);
                 arena_pool.destroy(arena);
+
+                request.*.deinit(map_pool) catch {
+                    logger.err("Failed to deinit request", .{});
+                };
+                request_pool.destroy(request);
             }
 
             if (status < 0) {
@@ -294,18 +301,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const state: *State = @ptrCast(@alignCast(req.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
-            const request_pool = ctx.*.request_allocator;
-            const map_pool = ctx.*.map_allocator;
-
             _ = state.*.reference_count.fetchAdd(1, .seq_cst);
 
             const request = state.*.request;
-            defer {
-                request.*.deinit(map_pool) catch {
-                    logger.err("Failed to deinit request", .{});
-                };
-                request_pool.destroy(request);
-            }
 
             const response = create_response(ctx) catch |err| {
                 logger.err("Error creating response: {}", .{err});
@@ -497,6 +495,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_timer_start(&state.*.timer, on_timeout, ctx.*.timeout, 0);
 
             state.*.request_raw = null;
+            _ = state.*.reference_count.fetchSub(1, .seq_cst);
             _ = uv.uv_read_start(req.*.handle, alloc_buffer, on_read);
         }
 
@@ -582,10 +581,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 ctx.*.allocator.free(request_raw);
             }
 
+            _ = state.*.reference_count.fetchAdd(1, .seq_cst);
             if (state.*.reference_count.load(.seq_cst) == 0) {
                 _ = uv.uv_close(@ptrCast(stream), on_close);
             } else {
-                _ = state.*.reference_count.fetchAdd(1, .seq_cst);
                 set_response_and_send(state, Response.set_timeout_response);
             }
         }
