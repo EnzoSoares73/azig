@@ -512,620 +512,743 @@ test "request with query parameters" {
     try request.deinit(&map_pool);
 }
 
-test "parse chunked body" {
+test "test basic chunked body parsing" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var map_pool = map_t.init(allocator);
 
-    // Test basic chunked body parsing
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "7\r\n" ++
-            "Mozilla\r\n" ++
-            "9\r\n" ++
-            "Developer\r\n" ++
-            "7\r\n" ++
-            "Network\r\n" ++
-            "0\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "7\r\n" ++
+        "Mozilla\r\n" ++
+        "9\r\n" ++
+        "Developer\r\n" ++
+        "7\r\n" ++
+        "Network\r\n" ++
+        "0\r\n" ++
+        "\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-        try request.parse_chunked_body();
+    try request.parse_chunked_body();
 
-        try testing.expectEqualStrings("MozillaDeveloperNetwork", request.body.?);
-    }
-
-    // Test with empty chunk in the middle
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "Hello\r\n" ++
-            "0\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "World\r\n" ++
-            "0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
-    }
-
-    // Test with decimal chunk size
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "A\r\n" ++
-            "0123456789\r\n" ++
-            "0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try request.parse_chunked_body();
-
-        try testing.expectEqualStrings("0123456789", request.body.?);
-    }
-
-    // Test with missing terminating chunk
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "Hello\r\n" ++
-            "5\r\n" ++
-            "World\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
-    }
-
-    // Test with invalid chunk size
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "XYZ\r\n" ++
-            "Hello\r\n" ++
-            "0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.InvalidCharacter, request.parse_chunked_body());
-    }
-
-    // Test with chunk size too large (would go beyond end of body)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "50\r\n" ++
-            "Hello\r\n" ++
-            "0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
-    }
-
-    // Test with missing CRLF after chunk data
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "Hello" ++
-            "0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
-    }
-
-    // Test with content after final chunk
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST /submit HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "Hello\r\n" ++
-            "0\r\n" ++
-            "\r\n" ++
-            "Extra content that shouldn't be here";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
-    }
+    try testing.expectEqualStrings("MozillaDeveloperNetwork", request.body.?);
 }
 
-test "is_finished_reading function" {
+test "test with empty chunk in the middle" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var map_pool = map_t.init(allocator);
 
-    // Test with Content-Length header matching body length
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Content-Length: 11\r\n" ++
-            "\r\n" ++
-            "Hello World";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "Hello\r\n" ++
+        "0\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "World\r\n" ++
+        "0\r\n" ++
+        "\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-        try testing.expect(try request.is_finished_reading());
-    }
-
-    // Test with Content-Length header but body is shorter
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Content-Length: 20\r\n" ++
-            "\r\n" ++
-            "Hello World";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(!try request.is_finished_reading());
-    }
-
-    // Test with Content-Length header but body is longer
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Content-Length: 5\r\n" ++
-            "\r\n" ++
-            "Hello World";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.BadRequest, request.is_finished_reading());
-    }
-
-    // Test with Content-Length: 0 and no body
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Content-Length: 0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(try request.is_finished_reading());
-    }
-
-    // Test with Transfer-Encoding: chunked and complete body
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "Hello\r\n" ++
-            "6\r\n" ++
-            " World\r\n" ++
-            "0\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(try request.is_finished_reading());
-    }
-
-    // Test with Transfer-Encoding: chunked but incomplete body
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "5\r\n" ++
-            "Hello\r\n" ++
-            "6\r\n" ++
-            " World\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(!try request.is_finished_reading());
-    }
-
-    // Test with both Content-Length and Transfer-Encoding: chunked (should error)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Content-Length: 11\r\n" ++
-            "Transfer-Encoding: chunked\r\n" ++
-            "\r\n" ++
-            "Hello World";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.BadRequest, request.is_finished_reading());
-    }
-
-    // Test with no Content-Length or Transfer-Encoding and no body
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(try request.is_finished_reading());
-    }
-
-    // Test with no Content-Length or Transfer-Encoding but with body (should error)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "POST / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "\r\n" ++
-            "Unexpected body";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expectError(error.BadRequest, request.is_finished_reading());
-    }
+    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
 }
 
-test "is_keep_alive function" {
+test "test with decimal chunk size" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var map_pool = map_t.init(allocator);
 
-    // Test with Connection: keep-alive header
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Connection: keep-alive\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "A\r\n" ++
+        "0123456789\r\n" ++
+        "0\r\n" ++
+        "\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-        try testing.expect(request.is_keep_alive());
-    }
+    try request.parse_chunked_body();
 
-    // Test with Connection: close header
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(!request.is_keep_alive());
-    }
-
-    // Test with no Connection header (should default to keep-alive)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(request.is_keep_alive());
-    }
-
-    // Test with mixed case Connection header
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
-
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "Connection: Keep-Alive\r\n" ++
-            "\r\n";
-
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-
-        try testing.expect(request.is_keep_alive());
-    }
+    try testing.expectEqualStrings("0123456789", request.body.?);
 }
 
-test "host validation" {
+test "test with missing terminating chunk" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var map_pool = map_t.init(allocator);
 
-    // Test valid IP addresses
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: 192.168.1.1\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "Hello\r\n" ++
+        "5\r\n" ++
+        "World\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-    }
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-    // Test valid IP address with port
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+}
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: 192.168.1.1:8080\r\n" ++
-            "\r\n";
+test "test with invalid chunk size" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-    }
+    var map_pool = map_t.init(allocator);
 
-    // Test valid domain name
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "XYZ\r\n" ++
+        "Hello\r\n" ++
+        "0\r\n" ++
+        "\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-    }
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-    // Test valid domain name with subdomain
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    try testing.expectError(error.InvalidCharacter, request.parse_chunked_body());
+}
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: sub.example.com\r\n" ++
-            "\r\n";
+test "test with chunk size too large (would go beyond end of body)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-    }
+    var map_pool = map_t.init(allocator);
 
-    // Test valid domain name with port
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example.com:8080\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "50\r\n" ++
+        "Hello\r\n" ++
+        "0\r\n" ++
+        "\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-    }
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-    // Test domain with hyphens
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+}
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: my-example-domain.com\r\n" ++
-            "\r\n";
+test "test with missing CRLF after chunk data" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try request.parse_request(mutable_request);
-    }
+    var map_pool = map_t.init(allocator);
 
-    // Test invalid domain (starts with hyphen)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: -example.com\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "Hello" ++
+        "0\r\n" ++
+        "\r\n";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
-    }
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-    // Test invalid domain (ends with hyphen)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+}
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example-.com\r\n" ++
-            "\r\n";
+test "test with content after final chunk" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
-    }
+    var map_pool = map_t.init(allocator);
 
-    // Test invalid domain (contains invalid character)
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: example!.com\r\n" ++
-            "\r\n";
+    const request_raw =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "Hello\r\n" ++
+        "0\r\n" ++
+        "\r\n" ++
+        "Extra content that shouldn't be here";
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
-    }
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
 
-    // Test empty host
-    {
-        var request = try request_t(void).init(&map_pool);
-        defer request.deinit(&map_pool) catch {};
+    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+}
 
-        const request_raw =
-            "GET / HTTP/1.1\r\n" ++
-            "Host: \r\n" ++
-            "\r\n";
+test "is_finished_reading with Content-Length matching body length" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-        const mutable_request = try allocator.dupe(u8, request_raw);
-        defer allocator.free(mutable_request);
-        try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
-    }
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 11\r\n" ++
+        "\r\n" ++
+        "Hello World";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(try request.is_finished_reading());
+}
+
+test "is_finished_reading with Content-Length greater than body length" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 20\r\n" ++
+        "\r\n" ++
+        "Hello World";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(!try request.is_finished_reading());
+}
+
+test "is_finished_reading with Content-Length less than body length" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "Hello World";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expectError(error.BadRequest, request.is_finished_reading());
+}
+
+test "is_finished_reading with Content-Length zero and no body" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(try request.is_finished_reading());
+}
+
+test "is_finished_reading with Transfer-Encoding chunked and complete body" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "Hello\r\n" ++
+        "6\r\n" ++
+        " World\r\n" ++
+        "0\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(try request.is_finished_reading());
+}
+
+test "is_finished_reading with Transfer-Encoding chunked and incomplete body" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n" ++
+        "Hello\r\n" ++
+        "6\r\n" ++
+        " World\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(!try request.is_finished_reading());
+}
+
+test "is_finished_reading with both Content-Length and Transfer-Encoding chunked" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 11\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "Hello World";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expectError(error.BadRequest, request.is_finished_reading());
+}
+
+test "is_finished_reading with no Content-Length or Transfer-Encoding and no body" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(try request.is_finished_reading());
+}
+
+test "is_finished_reading with no Content-Length or Transfer-Encoding but with body" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "POST / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n" ++
+        "Unexpected body";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expectError(error.BadRequest, request.is_finished_reading());
+}
+
+test "is_keep_alive with keep-alive header" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(request.is_keep_alive());
+}
+
+test "is_keep_alive with close header" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(!request.is_keep_alive());
+}
+
+test "is_keep_alive with no Connection header" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(request.is_keep_alive());
+}
+
+test "is_keep_alive with mixed case Connection header" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Keep-Alive\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+
+    try testing.expect(request.is_keep_alive());
+}
+
+test "host validation with valid IP address" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: 192.168.1.1\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+}
+
+test "host validation with valid IP address and port" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: 192.168.1.1:8080\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+}
+
+test "host validation with valid domain name" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+}
+
+test "host validation with valid domain name and subdomain" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: sub.example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+}
+
+test "host validation with valid domain name and port" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example.com:8080\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+}
+
+test "host validation with domain containing hyphens" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: my-example-domain.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try request.parse_request(mutable_request);
+}
+
+test "host validation with invalid domain starting with hyphen" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: -example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+}
+
+test "host validation with invalid domain ending with hyphen" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example-.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+}
+
+test "host validation with invalid domain containing invalid character" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: example!.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+}
+
+test "host validation with empty host" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: \r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
 }
