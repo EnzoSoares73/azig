@@ -38,7 +38,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         timer: uv.uv_timer_t,
         stream: [*c]uv.uv_stream_t,
         request_raw: ?[]u8,
-        reference_count: atomic.Value(u8),
+        reference_count: atomic.Value(i8),
         req: uv.uv_work_t,
         response: *Response,
         request: *Request,
@@ -71,6 +71,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         middleware_list: []const middleware,
         timeout: u64,
         max_payload_size: u64,
+        allowed_methods: []const []const u8,
     };
 
     return struct {
@@ -112,6 +113,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.middleware_list = middleware_list;
             ctx.*.timeout = config.timeout;
             ctx.*.max_payload_size = config.max_payload_size;
+            ctx.*.allowed_methods = config.allowed_methods;
 
             const cleanup = try init_pools(allocator.*, ctx, config.pool_size);
             defer cleanup(allocator.*, ctx);
@@ -201,7 +203,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .stream = stream,
                 .request = undefined,
                 .response = undefined,
-                .reference_count = atomic.Value(u8).init(0),
+                .reference_count = atomic.Value(i8).init(0),
                 .req = undefined,
                 .on_write_cb = undefined,
                 .request_raw = null,
@@ -439,12 +441,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     };
 
                     // The headers of the request must be included in the first buffer.
-                    request.*.parse_request(request_raw) catch |err| {
+                    request.*.parse_request(request_raw, ctx.*.allowed_methods) catch |err| {
                         logger.info("{}", .{err});
                         const http_error = toHttpError(err, HttpError.BadRequest);
-                        set_response_and_send(state, errorToStatusCode(http_error));
-                        _ = uv.uv_read_stop(state.*.stream);
-                        ctx.*.allocator.*.free(request_raw);
+                        handle_error_and_stop_reading(state, errorToStatusCode(http_error));
                         return;
                     };
 
@@ -455,22 +455,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                 const request = state.*.request;
                 const has_finished_reading = request.*.is_finished_reading() catch {
-                    set_response_and_send(state, 400);
-                    _ = uv.uv_read_stop(state.*.stream);
-                    if (state.*.request_raw) |request_raw| {
-                        ctx.*.allocator.*.free(request_raw);
-                    }
+                    handle_error_and_stop_reading(state, 400);
                     return;
                 };
                 if (has_finished_reading) {
                     const transfer_encoding = request.*.get_header("Transfer-Encoding");
                     if (transfer_encoding != null and std.ascii.eqlIgnoreCase(transfer_encoding.?, "chunked")) {
                         request.*.parse_chunked_body() catch {
-                            set_response_and_send(state, 400);
-                            _ = uv.uv_read_stop(state.*.stream);
-                            if (state.*.request_raw) |request_raw| {
-                                ctx.*.allocator.*.free(request_raw);
-                            }
+                            handle_error_and_stop_reading(state, 400);
                             return;
                         };
                     }
@@ -582,6 +574,21 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             send_response(response, state, on_write_complete_no_keep_alive);
         }
 
+        fn handle_error_and_stop_reading(state: *State, code: u16) void {
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
+            _ = state.*.reference_count.fetchAdd(1, .seq_cst);
+            set_response_and_send(state, code);
+            _ = uv.uv_read_stop(state.*.stream);
+
+            if (state.*.request_raw) |request_raw| {
+                ctx.*.allocator.*.free(request_raw);
+            }
+
+            // TODO remove this
+            std.time.sleep(1 * std.time.ns_per_ms);
+        }
+
         fn on_timeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
             logger.info("Connection closing due to inactivity", .{});
 
@@ -609,7 +616,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             _ = uv.uv_timer_stop(&state.*.timer);
             _ = state.*.reference_count.fetchSub(1, .seq_cst);
 
-            if (state.*.reference_count.load(.seq_cst) == 0) {
+            if (state.*.reference_count.load(.seq_cst) <= 0) {
                 logger.info("Connection closed", .{});
                 const client_pool = ctx.client_allocator;
                 const client: *uv.uv_tcp_t = @ptrCast(@alignCast(handle));

@@ -48,6 +48,7 @@ pub fn action_t(comptime AppContext: type, comptime RequestContext: type) type {
 const std = @import("std");
 const testing = std.testing;
 const map_t = @import("constants.zig").map_t;
+const ALLOWED_METHODS: *const [6][]const u8 = &.{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"};
 
 test "action_t with void AppContext calls callback when no middlewares" {
     const TestRequestContext = void;
@@ -72,7 +73,7 @@ test "action_t with void AppContext calls callback when no middlewares" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {
@@ -122,7 +123,7 @@ test "should return early if middleware does not call next()" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {
@@ -180,7 +181,7 @@ test "should call middlewares in order" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     const Callback = callback_t(AppContext, TestRequestContext);
     const callback: Callback = struct {

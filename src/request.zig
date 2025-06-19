@@ -6,6 +6,8 @@ const ascii = std.ascii;
 const map_t = @import("constants.zig").map_t;
 const testing = std.testing;
 const supported_versions = @import("constants.zig").supported_versions;
+const HttpError = @import("http_error.zig").HttpError;
+
 
 pub fn request_t(comptime RequestContext: type) type {
     return struct {
@@ -63,14 +65,14 @@ pub fn request_t(comptime RequestContext: type) type {
                 var slider: u64 = 0;
                 var cursor: u64 = 0;
 
-                const end_pos = std.mem.indexOf(u8, body, "0\r\n\r\n") orelse return error.InvalidRequest;
+                const end_pos = std.mem.indexOf(u8, body, "0\r\n\r\n") orelse return HttpError.BadRequest;
 
                 if (end_pos + 5 < body.len) {
-                    return error.InvalidRequest;
+                    return HttpError.BadRequest;
                 }
 
                 while (slider < end_pos) {
-                    const chunk_pos = std.mem.indexOf(u8, body[slider..], "\r\n") orelse return error.InvalidRequest;
+                    const chunk_pos = std.mem.indexOf(u8, body[slider..], "\r\n") orelse return HttpError.BadRequest;
                     const chunk_size = try std.fmt.parseInt(u64, body[slider .. chunk_pos + slider], 16);
 
                     const chunk_start = chunk_pos + slider + 2;
@@ -78,7 +80,7 @@ pub fn request_t(comptime RequestContext: type) type {
 
                     // Prevents segfaults
                     if (chunk_end > end_pos or chunk_size < 0) {
-                        return error.InvalidRequest;
+                        return HttpError.BadRequest;
                     }
                     const chunk = body[chunk_start..chunk_end];
 
@@ -88,7 +90,7 @@ pub fn request_t(comptime RequestContext: type) type {
 
                     // There should be a "\r\n" between chunks
                     if (!std.mem.eql(u8, "\r\n", body[chunk_end..slider])) {
-                        return error.InvalidRequest;
+                        return HttpError.BadRequest;
                     }
                 }
                 self.body = body[0..cursor];
@@ -107,14 +109,27 @@ pub fn request_t(comptime RequestContext: type) type {
             }
         }
 
-        pub fn parse_request(self: *Self, request_raw: []u8) !void {
+        fn is_valid_method(method: []const u8, allowed_methods: []const []const u8) bool {
+            for (allowed_methods) |allowed_method| {
+                if (std.mem.eql(u8, method, allowed_method)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        pub fn parse_request(self: *Self, request_raw: []u8, allowed_methods: []const []const u8) !void {
             var i: usize = 0;
 
-            const method_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return error.InvalidRequest;
+            const method_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return HttpError.BadRequest;
             self.method = request_raw[i .. i + method_end];
             i += method_end + 1;
 
-            const path_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return error.InvalidRequest;
+            if (!is_valid_method(self.method, allowed_methods)) {
+                return HttpError.MethodNotAllowed;
+            }
+
+            const path_end = std.mem.indexOfScalar(u8, request_raw[i..], ' ') orelse return HttpError.BadRequest;
             self.path = request_raw[i .. i + path_end];
 
             if (std.mem.indexOfScalar(u8, self.path, '?')) |query_start| {
@@ -137,14 +152,14 @@ pub fn request_t(comptime RequestContext: type) type {
 
             i += path_end + 1;
 
-            const version_end = std.mem.indexOfScalar(u8, request_raw[i..], '\r') orelse return error.InvalidRequest;
+            const version_end = std.mem.indexOfScalar(u8, request_raw[i..], '\r') orelse return HttpError.BadRequest;
             self.version = request_raw[i .. i + version_end];
             for (supported_versions) |supported_version| {
                 if (mem.eql(u8, self.version, supported_version)) {
                     break;
                 }
             } else {
-                return error.UnsupportedVersion;
+                return HttpError.HTTPVersionNotSupported;
             }
             i += version_end + 2;
 
@@ -155,8 +170,8 @@ pub fn request_t(comptime RequestContext: type) type {
                     break;
                 }
 
-                const line_end = std.mem.indexOfScalarPos(u8, request_raw, i, '\r') orelse return error.InvalidRequest;
-                const colon_pos = std.mem.indexOfScalar(u8, request_raw[i..line_end], ':') orelse return error.InvalidHeader;
+                const line_end = std.mem.indexOfScalarPos(u8, request_raw, i, '\r') orelse return HttpError.BadRequest;
+                const colon_pos = std.mem.indexOfScalar(u8, request_raw[i..line_end], ':') orelse return HttpError.BadRequest;
 
                 const key = std.mem.trim(u8, request_raw[i .. i + colon_pos], " ");
                 const value = std.mem.trim(u8, request_raw[i + colon_pos + 1 .. line_end], " ");
@@ -171,7 +186,7 @@ pub fn request_t(comptime RequestContext: type) type {
             }
 
             if (!hasHostHeader) {
-                return error.hostNotFound;
+                return HttpError.BadRequest;
             }
 
             if (i < request_raw.len) {
@@ -241,7 +256,7 @@ pub fn request_t(comptime RequestContext: type) type {
             // A request should not have both Content-Length and Transfer-Encoding: chunked
             if (transfer_encoding_header) |header| {
                 if (content_length_header != null and std.ascii.eqlIgnoreCase(header, "chunked")) {
-                    return error.BadRequest;
+                    return HttpError.BadRequest;
                 }
             }
 
@@ -251,7 +266,7 @@ pub fn request_t(comptime RequestContext: type) type {
                     if (content_length == body.len) {
                         return true;
                     } else if (content_length < body.len) {
-                        return error.BadRequest;
+                        return HttpError.BadRequest;
                     } else {
                         return false;
                     }
@@ -274,7 +289,7 @@ pub fn request_t(comptime RequestContext: type) type {
                 if (self.*.body == null) {
                     return true;
                 } else {
-                    return error.BadRequest;
+                    return HttpError.BadRequest;
                 }
             }
         }
@@ -292,6 +307,8 @@ pub fn request_t(comptime RequestContext: type) type {
         }
     };
 }
+
+const ALLOWED_METHODS: *const [6][]const u8 = &.{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"};
 
 test "Request initialization and cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -324,9 +341,7 @@ test "parse simple GET request" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
-
-    try request.parse_request(@constCast(mutable_request));
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expectEqualStrings("GET", request.method);
     try testing.expectEqualStrings("/index.html", request.path);
@@ -358,9 +373,7 @@ test "parse POST request with body" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
-
-    try request.parse_request(@constCast(mutable_request));
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expectEqualStrings("POST", request.method);
     try testing.expectEqualStrings("/submit", request.path);
@@ -392,9 +405,7 @@ test "header name capitalization" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
-
-    try request.parse_request(@constCast(mutable_request));
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(request.get_header("Content-Type") != null);
     try testing.expect(request.get_header("User-Agent") != null);
@@ -412,13 +423,11 @@ test "invalid request format" {
 
     var request = try request_t(void).init(&map_pool);
 
-    try testing.expectError(error.InvalidRequest, request.parse_request(@constCast("/path HTTP/1.1\r\n\r\n")));
+    try testing.expectError(HttpError.BadRequest, request.parse_request(@constCast("GET HTTP/1.1\r\n\r\n"), ALLOWED_METHODS));
 
-    try testing.expectError(error.InvalidRequest, request.parse_request(@constCast("GET HTTP/1.1\r\n\r\n")));
+    try testing.expectError(HttpError.HTTPVersionNotSupported, request.parse_request(@constCast("GET /path HTTP/1\r\n\r\n"), ALLOWED_METHODS));
 
-    try testing.expectError(error.UnsupportedVersion, request.parse_request(@constCast("GET /path HTTP/1\r\n\r\n")));
-
-    try testing.expectError(error.InvalidHeader, request.parse_request(@constCast("GET /path HTTP/1.1\r\ninvalidheader\r\n\r\n")));
+    try testing.expectError(HttpError.BadRequest, request.parse_request(@constCast("GET /path HTTP/1.1\r\ninvalidheader\r\n\r\n"), ALLOWED_METHODS));
 
     try request.deinit(&map_pool);
 }
@@ -442,9 +451,7 @@ test "request with multiple headers" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
-
-    try request.parse_request(@constCast(mutable_request));
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expectEqual(@as(usize, 4), request.headers.*.count());
     try testing.expectEqualStrings("example.com", request.get_header("Host").?);
@@ -472,9 +479,7 @@ test "request with empty headers" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
-
-    try request.parse_request(@constCast(mutable_request));
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expectEqual(@as(usize, 2), request.headers.*.count());
     try testing.expectEqualStrings("", request.get_header("Empty-Header").?);
@@ -498,9 +503,7 @@ test "request with query parameters" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
-
-    try request.parse_request(@constCast(mutable_request));
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expectEqualStrings("/path", request.path);
 
@@ -538,7 +541,7 @@ test "test basic chunked body parsing" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try request.parse_chunked_body();
 
@@ -571,9 +574,9 @@ test "test with empty chunk in the middle" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+    try testing.expectError(HttpError.BadRequest, request.parse_chunked_body());
 }
 
 test "test with decimal chunk size" {
@@ -598,7 +601,7 @@ test "test with decimal chunk size" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try request.parse_chunked_body();
 
@@ -627,9 +630,9 @@ test "test with missing terminating chunk" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+    try testing.expectError(HttpError.BadRequest, request.parse_chunked_body());
 }
 
 test "test with invalid chunk size" {
@@ -654,7 +657,7 @@ test "test with invalid chunk size" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expectError(error.InvalidCharacter, request.parse_chunked_body());
 }
@@ -681,9 +684,9 @@ test "test with chunk size too large (would go beyond end of body)" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+    try testing.expectError(HttpError.BadRequest, request.parse_chunked_body());
 }
 
 test "test with missing CRLF after chunk data" {
@@ -708,9 +711,9 @@ test "test with missing CRLF after chunk data" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+    try testing.expectError(HttpError.BadRequest, request.parse_chunked_body());
 }
 
 test "test with content after final chunk" {
@@ -736,9 +739,9 @@ test "test with content after final chunk" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.InvalidRequest, request.parse_chunked_body());
+    try testing.expectError(HttpError.BadRequest, request.parse_chunked_body());
 }
 
 test "is_finished_reading with Content-Length matching body length" {
@@ -760,7 +763,7 @@ test "is_finished_reading with Content-Length matching body length" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(try request.is_finished_reading());
 }
@@ -784,7 +787,7 @@ test "is_finished_reading with Content-Length greater than body length" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(!try request.is_finished_reading());
 }
@@ -808,9 +811,9 @@ test "is_finished_reading with Content-Length less than body length" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.BadRequest, request.is_finished_reading());
+    try testing.expectError(HttpError.BadRequest, request.is_finished_reading());
 }
 
 test "is_finished_reading with Content-Length zero and no body" {
@@ -831,7 +834,7 @@ test "is_finished_reading with Content-Length zero and no body" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(try request.is_finished_reading());
 }
@@ -860,7 +863,7 @@ test "is_finished_reading with Transfer-Encoding chunked and complete body" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(try request.is_finished_reading());
 }
@@ -887,7 +890,7 @@ test "is_finished_reading with Transfer-Encoding chunked and incomplete body" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(!try request.is_finished_reading());
 }
@@ -912,9 +915,9 @@ test "is_finished_reading with both Content-Length and Transfer-Encoding chunked
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.BadRequest, request.is_finished_reading());
+    try testing.expectError(HttpError.BadRequest, request.is_finished_reading());
 }
 
 test "is_finished_reading with no Content-Length or Transfer-Encoding and no body" {
@@ -934,7 +937,7 @@ test "is_finished_reading with no Content-Length or Transfer-Encoding and no bod
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(try request.is_finished_reading());
 }
@@ -957,9 +960,9 @@ test "is_finished_reading with no Content-Length or Transfer-Encoding but with b
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
-    try testing.expectError(error.BadRequest, request.is_finished_reading());
+    try testing.expectError(HttpError.BadRequest, request.is_finished_reading());
 }
 
 test "is_keep_alive with keep-alive header" {
@@ -980,7 +983,7 @@ test "is_keep_alive with keep-alive header" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(request.is_keep_alive());
 }
@@ -1003,7 +1006,7 @@ test "is_keep_alive with close header" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(!request.is_keep_alive());
 }
@@ -1025,7 +1028,7 @@ test "is_keep_alive with no Connection header" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(request.is_keep_alive());
 }
@@ -1048,7 +1051,7 @@ test "is_keep_alive with mixed case Connection header" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 
     try testing.expect(request.is_keep_alive());
 }
@@ -1070,7 +1073,7 @@ test "host validation with valid IP address" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 }
 
 test "host validation with valid IP address and port" {
@@ -1090,7 +1093,7 @@ test "host validation with valid IP address and port" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 }
 
 test "host validation with valid domain name" {
@@ -1110,7 +1113,7 @@ test "host validation with valid domain name" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 }
 
 test "host validation with valid domain name and subdomain" {
@@ -1130,7 +1133,7 @@ test "host validation with valid domain name and subdomain" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 }
 
 test "host validation with valid domain name and port" {
@@ -1150,7 +1153,7 @@ test "host validation with valid domain name and port" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 }
 
 test "host validation with domain containing hyphens" {
@@ -1170,7 +1173,7 @@ test "host validation with domain containing hyphens" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request);
+    try request.parse_request(mutable_request, ALLOWED_METHODS);
 }
 
 test "host validation with invalid domain starting with hyphen" {
@@ -1190,7 +1193,7 @@ test "host validation with invalid domain starting with hyphen" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+    try testing.expectError(HttpError.BadRequest, request.parse_request(mutable_request, ALLOWED_METHODS));
 }
 
 test "host validation with invalid domain ending with hyphen" {
@@ -1210,7 +1213,7 @@ test "host validation with invalid domain ending with hyphen" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+    try testing.expectError(HttpError.BadRequest, request.parse_request(mutable_request, ALLOWED_METHODS));
 }
 
 test "host validation with invalid domain containing invalid character" {
@@ -1230,7 +1233,7 @@ test "host validation with invalid domain containing invalid character" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+    try testing.expectError(HttpError.BadRequest, request.parse_request(mutable_request, ALLOWED_METHODS));
 }
 
 test "host validation with empty host" {
@@ -1250,5 +1253,25 @@ test "host validation with empty host" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try testing.expectError(error.hostNotFound, request.parse_request(mutable_request));
+    try testing.expectError(HttpError.BadRequest, request.parse_request(mutable_request, ALLOWED_METHODS));
+}
+
+test "validate method function with invalid method" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = map_t.init(allocator);
+
+    var request = try request_t(void).init(&map_pool);
+    defer request.deinit(&map_pool) catch {};
+
+    const request_raw =
+        "INVALID / HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const mutable_request = try allocator.dupe(u8, request_raw);
+    defer allocator.free(mutable_request);
+    try testing.expectError(HttpError.MethodNotAllowed, request.parse_request(mutable_request, ALLOWED_METHODS));
 }

@@ -2,7 +2,7 @@ const std = @import("std");
 const azig = @import("azig.zig").Azig(void, void);
 
 pub const std_options: std.Options = .{
-    .log_level = .err
+    .log_level = .info
 };
 
 pub fn main() !void {
