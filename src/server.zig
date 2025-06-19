@@ -19,6 +19,10 @@ const arena_pool_t = @import("constants.zig").arena_pool_t;
 const middleware_t = @import("constants.zig").middleware_t;
 const map_t = @import("constants.zig").map_t;
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
+const errorToStatusCode = @import("http_error.zig").errorToStatusCode;
+const HttpError = @import("http_error.zig").HttpError;
+const toHttpError = @import("http_error.zig").toHttpError;
+
 
 const logger = std.log.scoped(.server);
 
@@ -330,8 +334,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .response = response,
                 .callback = ctx.*.callback,
             };
-            action.next() catch {
-                response.*.set_error_response();
+            action.next() catch |err| {
+                const http_error = toHttpError(err, HttpError.InternalServerError);
+                response.*.set_response_error(errorToStatusCode(http_error));
             };
         }
 
@@ -401,7 +406,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     defer ctx.*.allocator.*.free(old_buffer);
 
                     if (old_buffer.len + new_read > ctx.*.max_payload_size) {
-                        set_response_and_send(state, Response.set_payload_too_large_response);
+                        set_response_and_send(state, 413);
                         _ = uv.uv_read_stop(state.*.stream);
                         return;
                     }
@@ -435,9 +440,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                     // The headers of the request must be included in the first buffer.
                     request.*.parse_request(request_raw) catch |err| {
-                        logger.err("{}", .{err});
-                        set_response_and_send(state, Response.set_bad_request_response);
+                        logger.info("{}", .{err});
+                        const http_error = toHttpError(err, HttpError.BadRequest);
+                        set_response_and_send(state, errorToStatusCode(http_error));
                         _ = uv.uv_read_stop(state.*.stream);
+                        ctx.*.allocator.*.free(request_raw);
                         return;
                     };
 
@@ -448,16 +455,22 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
                 const request = state.*.request;
                 const has_finished_reading = request.*.is_finished_reading() catch {
-                    set_response_and_send(state, Response.set_bad_request_response);
+                    set_response_and_send(state, 400);
                     _ = uv.uv_read_stop(state.*.stream);
+                    if (state.*.request_raw) |request_raw| {
+                        ctx.*.allocator.*.free(request_raw);
+                    }
                     return;
                 };
                 if (has_finished_reading) {
                     const transfer_encoding = request.*.get_header("Transfer-Encoding");
                     if (transfer_encoding != null and std.ascii.eqlIgnoreCase(transfer_encoding.?, "chunked")) {
                         request.*.parse_chunked_body() catch {
-                            set_response_and_send(state, Response.set_bad_request_response);
+                            set_response_and_send(state, 400);
                             _ = uv.uv_read_stop(state.*.stream);
+                            if (state.*.request_raw) |request_raw| {
+                                ctx.*.allocator.*.free(request_raw);
+                            }
                             return;
                         };
                     }
@@ -472,7 +485,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx.*.allocator.*.free(request_raw);
                 }
                 switch (nread) {
-                    // There is no more data to be read
+                // There is no more data to be read
                     uv.UV_EOF => {},
                     else => {
                         logger.err("Read error: {s}", .{uv.uv_strerror(@intCast(nread))});
@@ -542,7 +555,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             };
         }
 
-        fn set_response_and_send(state: *State, set_response_fn: ?*const fn (*Response) void) void {
+        fn set_response_and_send(state: *State, code: u16) void {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             const response_pool = ctx.*.response_allocator;
@@ -553,9 +566,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 logger.err("Error creating response: {}", .{err});
                 return;
             };
-            if (set_response_fn) |function| {
-                function(response);
-            }
+
+            response.*.set_response_error(code);
+
             defer {
                 const arena = response.*.arena;
                 response.arena.*.deinit();
@@ -585,7 +598,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (state.*.reference_count.load(.seq_cst) == 0) {
                 _ = uv.uv_close(@ptrCast(stream), on_close);
             } else {
-                set_response_and_send(state, Response.set_timeout_response);
+                set_response_and_send(state, 408);
             }
         }
 
@@ -708,11 +721,11 @@ test "testing server" {
                 response.*.body = "Home Page";
                 try response.*.addHeader("Content-Type", "text/plain");
             } else if (std.mem.eql(u8, request.path, "/error")) {
-                response.*.set_error_response();
+                return HttpError.InternalServerError;
             } else if (std.mem.eql(u8, request.path, "/bad-request")) {
-                response.*.set_bad_request_response();
+                return HttpError.BadRequest;
             } else if (std.mem.eql(u8, request.path, "/timeout")) {
-                response.*.set_timeout_response();
+                response.*.set_response_error(408);
             } else if (std.mem.eql(u8, request.path, "/custom-status")) {
                 response.*.status_code = 201;
                 response.*.body = "Created";

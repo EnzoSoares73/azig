@@ -4,6 +4,7 @@ const StringHashMap = std.StringHashMap;
 const mem = std.mem;
 const map_t = @import("constants.zig").map_t;
 const testing = std.testing;
+const statusCodeToMessage = @import("http_error.zig").statusCodeToMessage;
 
 pub const ResponseString = struct {
     string: []const u8,
@@ -57,7 +58,7 @@ pub const Response = struct {
     fn calculate_serialized_size(self: *Self) !usize {
         var size: usize = 0;
 
-        const status_text = statusCodeToString(self.status_code) orelse "Unknown";
+        const status_text = statusCodeToMessage(self.status_code) orelse "Unknown";
         size += "HTTP/1.1 ".len;
         size += std.fmt.count("{d}", .{self.status_code});
         size += " ".len;
@@ -91,7 +92,7 @@ pub const Response = struct {
     fn write_to_stream(self: *Self, writer: anytype) !void {
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
             self.status_code,
-            statusCodeToString(self.status_code) orelse "Unknown",
+            statusCodeToMessage(self.status_code) orelse "Unknown",
         });
 
         var headers_iter = self.headers.*.iterator();
@@ -118,44 +119,10 @@ pub const Response = struct {
         return buffer[0..stream.pos];
     }
 
-    pub fn set_error_response(self: *Self) void {
+    pub fn set_response_error(self: *Self, code: u16) void {
         self.*.headers.clearRetainingCapacity();
         self.*.body = null;
-        self.*.status_code = 500;
-    }
-
-    pub fn set_bad_request_response(self: *Self) void {
-        self.*.headers.clearRetainingCapacity();
-        self.*.body = null;
-        self.*.status_code = 400;
-    }
-
-    pub fn set_payload_too_large_response(self: *Self) void {
-        self.*.headers.clearRetainingCapacity();
-        self.*.body = null;
-        self.*.status_code = 413;
-    }
-
-    pub fn set_timeout_response(self: *Self) void {
-        self.*.headers.clearRetainingCapacity();
-        self.*.body = null;
-        self.*.status_code = 408;
-    }
-
-    fn statusCodeToString(code: u16) ?[]const u8 {
-        return switch (code) {
-            200 => "OK",
-            201 => "Created",
-            204 => "No Content",
-            400 => "Bad Request",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            404 => "Not Found",
-            408 => "Request Timeout",
-            413 => "Payload too Large",
-            500 => "Internal Server Error",
-            else => null,
-        };
+        self.*.status_code = code;
     }
 };
 
