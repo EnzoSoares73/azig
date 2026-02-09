@@ -8,7 +8,6 @@ const testing = std.testing;
 const supported_versions = @import("constants.zig").supported_versions;
 const HttpError = @import("http_error.zig").HttpError;
 
-
 pub fn request_t(comptime RequestContext: type) type {
     return struct {
         method: []const u8,
@@ -208,16 +207,25 @@ pub fn request_t(comptime RequestContext: type) type {
         }
 
         fn is_valid_host(host: []const u8) bool {
-            var iterator = std.mem.splitScalar(u8, host, ':');
-            const first = iterator.next();
-            if (first) |hostname| {
-                if (std.net.Address.parseIp(hostname, @intCast(0))) |_| {
+            if (std.Io.net.IpAddress.parseLiteral(host)) |_| {
+                return true;
+            } else |_| {
+                var iterator = std.mem.splitScalar(u8, host, ':');
+                if (iterator.next()) |hostname| {
+                    if (!is_valid_domain(hostname)) return false;
+                    if (iterator.next()) |port| {
+                        return is_valid_port(port);
+                    }
                     return true;
-                } else |_| {
-                    return is_valid_domain(hostname);
                 }
+                return false;
             }
-            return false;
+        }
+
+        fn is_valid_port(port: []const u8) bool {
+            if (port.len == 0) return false;
+            const p = std.fmt.parseInt(u16, port, 10) catch return false;
+            return p > 0;
         }
 
         fn is_valid_domain(domain: []const u8) bool {
@@ -308,7 +316,7 @@ pub fn request_t(comptime RequestContext: type) type {
     };
 }
 
-const ALLOWED_METHODS: *const [6][]const u8 = &.{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"};
+const ALLOWED_METHODS: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
 
 test "Request initialization and cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

@@ -1,36 +1,39 @@
 const std = @import("std");
 const Options = std.heap.MemoryPoolOptions;
 const Mutex = std.Thread.Mutex;
+const Allocator = std.mem.Allocator;
+const Alignment = std.mem.Alignment;
 
 pub const MemoryPoolError = error{OutOfMemory};
 
 pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options) type {
+    if (pool_options.alignment) |a| {
+        if (a.compare(.eq, .of(Item))) {
+            var new_options = pool_options;
+            new_options.alignment = null;
+            return ThreadSafeMemoryPool(Item, new_options);
+        }
+    }
     return struct {
         const Pool = @This();
 
+        arena: std.heap.ArenaAllocator,
+        free_list: std.SinglyLinkedList,
+        mutex: std.Thread.Mutex,
+
         pub const item_size = @max(@sizeOf(Node), @sizeOf(Item));
 
-        const node_alignment = @alignOf(*anyopaque);
+        pub const item_alignment: Alignment = .max(pool_options.alignment orelse .of(Item), .of(Node));
 
-        pub const item_alignment = @max(node_alignment, pool_options.alignment orelse @alignOf(Item));
+        const Node = std.SinglyLinkedList.Node;
+        const ItemPtr = *align(item_alignment.toByteUnits()) Item;
 
-        const Node = struct {
-            next: ?*align(item_alignment) @This(),
-        };
-        const NodePtr = *align(item_alignment) Node;
-        const ItemPtr = *align(item_alignment) Item;
-
-        arena: std.heap.ArenaAllocator,
-        free_list: ?NodePtr = null,
-        mutex: std.Thread.Mutex,
-        var count: u16 = 0;
-
-        pub fn init(allocator: std.mem.Allocator) Pool {
-            return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = Mutex{} };
+        pub fn init(allocator: Allocator) Allocator.Error!Pool {
+            return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = Mutex{}, .free_list = .{} };
         }
 
-        pub fn initPreheated(allocator: std.mem.Allocator, initial_size: usize) MemoryPoolError!Pool {
-            var pool = init(allocator);
+        pub fn initPreheated(allocator: Allocator, initial_size: usize) MemoryPoolError!Pool {
+            var pool = try init(allocator);
             errdefer pool.deinit();
             try pool.preheat(initial_size);
             return pool;
@@ -41,50 +44,34 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
             pool.* = undefined;
         }
 
-        pub fn preheat(pool: *Pool, size: usize) MemoryPoolError!void {
+        pub fn preheat(pool: *Pool, num: usize) Allocator.Error!void {
             var i: usize = 0;
-            while (i < size) : (i += 1) {
-                const raw_mem = try pool.allocNew();
-                const free_node = @as(NodePtr, @ptrCast(raw_mem));
-                free_node.* = Node{
-                    .next = pool.free_list,
-                };
-                pool.free_list = free_node;
+            while (i < num) : (i += 1) {
+                const memory = try pool.allocNew();
+                pool.free_list.prepend(@ptrCast(memory));
             }
         }
 
         pub const ResetMode = std.heap.ArenaAllocator.ResetMode;
 
-        /// Resets the memory pool and destroys all allocated items.
-        /// This can be used to batch-destroy all objects without invalidating the memory pool.
-        ///
-        /// The function will return whether the reset operation was successful or not.
-        /// If the reallocation  failed `false` is returned. The pool will still be fully
-        /// functional in that case, all memory is released. Future allocations just might
-        /// be slower.
-        ///
-        /// NOTE: If `mode` is `free_all`, the function will always return `true`.
         pub fn reset(pool: *Pool, mode: ResetMode) bool {
             const reset_successful = pool.arena.reset(mode);
-
-            pool.free_list = null;
+            pool.free_list = .{};
 
             return reset_successful;
         }
 
-        pub fn create(pool: *Pool) !ItemPtr {
+        pub fn create(pool: *Pool) Allocator.Error!ItemPtr {
             pool.*.mutex.lock();
             defer pool.*.mutex.unlock();
 
-            const node = if (pool.free_list) |item| blk: {
-                pool.free_list = item.next;
-                break :blk item;
-            } else if (pool_options.growable)
-                @as(NodePtr, @ptrCast(try pool.allocNew()))
+            const ptr: ItemPtr = if (pool.free_list.popFirst()) |node|
+                @ptrCast(@alignCast(node))
+            else if (pool_options.growable)
+                @ptrCast(try pool.allocNew())
             else
                 return error.OutOfMemory;
 
-            const ptr = @as(ItemPtr, @ptrCast(node));
             ptr.* = undefined;
             return ptr;
         }
@@ -93,17 +80,13 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
             pool.*.mutex.lock();
             defer pool.*.mutex.unlock();
 
-            const node = @as(NodePtr, @ptrCast(ptr));
-
-            node.* = Node{
-                .next = pool.free_list,
-            };
-            pool.free_list = node;
+            ptr.* = undefined;
+            pool.free_list.prepend(@ptrCast(ptr));
         }
 
-        fn allocNew(pool: *Pool) MemoryPoolError!*align(item_alignment) [item_size]u8 {
-            const mem = try pool.arena.allocator().alignedAlloc(u8, item_alignment, item_size);
-            return mem[0..item_size];
+        fn allocNew(pool: *Pool) Allocator.Error!*align(item_alignment.toByteUnits()) [item_size]u8 {
+            const memory = try pool.*.arena.allocator().alignedAlloc(u8, item_alignment, item_size);
+            return memory[0..item_size];
         }
     };
 }

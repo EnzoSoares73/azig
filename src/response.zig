@@ -45,13 +45,11 @@ pub const Response = struct {
             var buffer: [4096]u8 = undefined;
             return .{ .string = try self.write_to_buffer(&buffer), .in_heap = false };
         } else {
-            const buffer = try allocator.alloc(u8, size);
-            errdefer allocator.free(buffer);
+            var allocating = try std.Io.Writer.Allocating.initCapacity(allocator, size);
+            errdefer allocating.deinit();
+            try self.write_to_stream(&allocating.writer);
 
-            var stream = std.io.fixedBufferStream(buffer);
-            try self.write_to_stream(stream.writer());
-
-            return .{ .string = buffer, .in_heap = true };
+            return .{ .string = allocating.written(), .in_heap = true };
         }
     }
 
@@ -89,7 +87,7 @@ pub const Response = struct {
         return size;
     }
 
-    fn write_to_stream(self: *Self, writer: anytype) !void {
+    fn write_to_stream(self: *Self, writer: *std.Io.Writer) !void {
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
             self.status_code,
             statusCodeToMessage(self.status_code) orelse "Unknown",
@@ -111,12 +109,11 @@ pub const Response = struct {
     }
 
     fn write_to_buffer(self: *Self, buffer: []u8) ![]const u8 {
-        var stream = std.io.fixedBufferStream(buffer);
-        const writer = stream.writer();
+        var writer = std.Io.Writer.fixed(buffer);
 
-        try write_to_stream(self, writer);
+        try write_to_stream(self, &writer);
 
-        return buffer[0..stream.pos];
+        return buffer[0..writer.end];
     }
 
     pub fn set_response_error(self: *Self, code: u16) void {

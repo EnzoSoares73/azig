@@ -6,22 +6,17 @@ pub fn build(b: *std.Build) !void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "azig",
+    const exe = b.addExecutable(.{ .name = "azig", .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-    });
+    }) });
 
     const libuv_dep = b.dependency("libuv", .{
         .target = target,
         .optimize = optimize,
     });
-    exe.linkLibrary(libuv_dep.artifact("uv"));
-
-    if (target.result.os.tag == .windows and optimize == .Debug) {
-        exe.linkSystemLibrary("ucrtbased");
-    }
+    exe.root_module.linkLibrary(libuv_dep.artifact("uv"));
 
     {
         const module = b.addModule("azig", .{
@@ -30,7 +25,6 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         });
         module.linkLibrary(libuv_dep.artifact("uv"));
-        module.linkSystemLibrary("ucrtbased", .{});
     }
 
     b.installArtifact(exe);
@@ -47,11 +41,13 @@ pub fn build(b: *std.Build) !void {
     run_step.dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/test.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-    unit_tests.linkLibrary(libuv_dep.artifact("uv"));
+    unit_tests.root_module.linkLibrary(libuv_dep.artifact("uv"));
     run_step.dependOn(&run_cmd.step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
