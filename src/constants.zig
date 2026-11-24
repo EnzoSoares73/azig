@@ -1,6 +1,6 @@
 const std = @import("std");
 const Response = @import("response.zig").Response;
-const uv = @import("imports/libuv.zig");
+const uv = @import("uv");
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 const MapPool = @import("pools/map_pool.zig").MapPool;
 const GenericRequest = @import("request.zig").GenericRequest;

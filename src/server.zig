@@ -1,7 +1,7 @@
 /// Represents a HTTP server implementation using libuv
 const std = @import("std");
 const mem = std.mem;
-const uv = @import("imports/libuv.zig");
+const uv = @import("uv");
 const Config = @import("config.zig").Config;
 const GenericRequest = @import("request.zig").GenericRequest;
 const Response = @import("response.zig").Response;
@@ -527,8 +527,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
-        fn onRead(client: *anyopaque, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
-            const stream: [*c]uv.uv_stream_t = @ptrCast(@alignCast(client));
+        fn onRead(stream: [*c]uv.uv_stream_t, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const state: *State = @ptrCast(@alignCast(stream.*.data));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
@@ -961,6 +960,19 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
 const testing = std.testing;
 
+fn waitUntilListening(server: anytype) !void {
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        {
+            server.mutex.lock();
+            defer server.mutex.unlock();
+            if (server.stop_signal != null) return;
+        }
+        std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(10) }, std.testing.io) catch {};
+    }
+    return error.ServerDidNotStart;
+}
+
 test "start returns an error when the port is already in use" {
     const TestServer = Server(void, void);
     const Request = GenericRequest(void);
@@ -986,7 +998,7 @@ test "start returns an error when the port is already in use" {
         thread.join();
     }
 
-    std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(500) }, std.testing.io) catch {};
+    try waitUntilListening(&first);
 
     var second = TestServer.init(allocator, .{ .port = 2601 }, onResponse, {});
     if (second.start()) |_| {
@@ -1061,6 +1073,8 @@ test "testing server" {
         thread.join();
     }
 
+    try waitUntilListening(&server);
+
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
@@ -1068,7 +1082,7 @@ test "testing server" {
     {
         var allocating = try std.Io.Writer.Allocating.initCapacity(allocator, 1024);
         defer allocating.deinit();
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri }, .response_writer = &allocating.writer });
 
         try testing.expectEqual(std.http.Status.ok, req.status);
@@ -1077,7 +1091,7 @@ test "testing server" {
 
     // GET request to error endpoint
     {
-        const uri = try std.Uri.parse("http://localhost:2500/error");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500/error");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri } });
 
         try testing.expectEqual(std.http.Status.internal_server_error, req.status);
@@ -1085,7 +1099,7 @@ test "testing server" {
 
     // GET request to bad-request endpoint
     {
-        const uri = try std.Uri.parse("http://localhost:2500/bad-request");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500/bad-request");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri } });
 
         try testing.expectEqual(std.http.Status.bad_request, req.status);
@@ -1093,7 +1107,7 @@ test "testing server" {
 
     // GET request to timeout endpoint
     {
-        const uri = try std.Uri.parse("http://localhost:2500/timeout");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500/timeout");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri } });
 
         try testing.expectEqual(std.http.Status.request_timeout, req.status);
@@ -1104,7 +1118,7 @@ test "testing server" {
         var allocating = try std.Io.Writer.Allocating.initCapacity(allocator, 1024);
         defer allocating.deinit();
 
-        const uri = try std.Uri.parse("http://localhost:2500/custom-status");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500/custom-status");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri }, .response_writer = &allocating.writer });
 
         try testing.expectEqual(std.http.Status.created, req.status);
@@ -1116,7 +1130,7 @@ test "testing server" {
         var allocating = try std.Io.Writer.Allocating.initCapacity(allocator, 1024);
         defer allocating.deinit();
 
-        const uri = try std.Uri.parse("http://localhost:2500/not-found");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500/not-found");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri }, .response_writer = &allocating.writer });
 
         try testing.expectEqual(std.http.Status.not_found, req.status);
@@ -1130,7 +1144,7 @@ test "testing server" {
             buffer[i] = @intCast(i % 256);
         }
 
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         const req = try client.fetch(.{ .method = .POST, .location = .{ .uri = uri }, .extra_headers = &.{.{ .name = "content_length", .value = "131072" }}, .payload = &buffer });
 
         try testing.expectEqual(std.http.Status.ok, req.status);
@@ -1148,14 +1162,14 @@ test "testing server" {
         var allocating = try std.Io.Writer.Allocating.initCapacity(allocator, payload.len);
         defer allocating.deinit();
 
-        const echo_uri = try std.Uri.parse("http://localhost:2500/chunked");
+        const echo_uri = try std.Uri.parse("http://127.0.0.1:2500/chunked");
         const echo = try client.fetch(.{ .method = .POST, .location = .{ .uri = echo_uri }, .payload = payload, .response_writer = &allocating.writer });
         try testing.expectEqual(std.http.Status.ok, echo.status);
         try testing.expectEqualSlices(u8, payload, allocating.written());
 
         var small = try std.Io.Writer.Allocating.initCapacity(allocator, 64);
         defer small.deinit();
-        const root_uri = try std.Uri.parse("http://localhost:2500");
+        const root_uri = try std.Uri.parse("http://127.0.0.1:2500");
         const root = try client.fetch(.{ .method = .GET, .location = .{ .uri = root_uri }, .response_writer = &small.writer });
         try testing.expectEqual(std.http.Status.ok, root.status);
         try testing.expectEqualStrings("Home Page", small.written());
@@ -1163,7 +1177,7 @@ test "testing server" {
 
     // POST explicit content-length = 0 and no body
     {
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         var req = try client.request(.POST, uri, .{});
         defer req.deinit();
 
@@ -1182,7 +1196,7 @@ test "testing server" {
 
     // POST content-length > 0 and stop sending data mid_request
     // {
-    //     const uri = try std.Uri.parse("http://localhost:2500");
+    //     const uri = try std.Uri.parse("http://127.0.0.1:2500");
     //     var req = try client.request(.POST, uri, .{});
     //     defer req.deinit();
     //
@@ -1204,7 +1218,7 @@ test "testing server" {
         var allocating = try std.Io.Writer.Allocating.initCapacity(allocator, 1024);
         defer allocating.deinit();
 
-        const uri = try std.Uri.parse("http://localhost:2500/chunked");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500/chunked");
         var req = try client.request(.POST, uri, .{});
         defer req.deinit();
 
@@ -1260,11 +1274,13 @@ test "should handle mid-request timeout gracefully" {
         thread.join();
     }
 
+    try waitUntilListening(&server);
+
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
     {
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri } });
 
         try testing.expectEqual(std.http.Status.request_timeout, req.status);
@@ -1305,11 +1321,13 @@ test "should handle mid-request timeout gracefully, where afterProcess is called
         thread.join();
     }
 
+    try waitUntilListening(&server);
+
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
     {
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri } });
 
         try testing.expectEqual(std.http.Status.request_timeout, req.status);
@@ -1346,6 +1364,8 @@ test "should enforce max_payload_size limit" {
         thread.join();
     }
 
+    try waitUntilListening(&server);
+
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
@@ -1355,7 +1375,7 @@ test "should enforce max_payload_size limit" {
             buffer[i] = @intCast(i % 256);
         }
 
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         var buf: [20]u8 = undefined;
         const size = try std.fmt.bufPrint(&buf, "{d}", .{buffer.len});
         const req = try client.fetch(.{ .method = .POST, .location = .{ .uri = uri }, .extra_headers = &.{.{ .name = "content_length", .value = size }}, .payload = &buffer });
@@ -1428,11 +1448,13 @@ test "should call middlewares in order" {
         thread.join();
     }
 
+    try waitUntilListening(&server);
+
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
     {
-        const uri = try std.Uri.parse("http://localhost:2500");
+        const uri = try std.Uri.parse("http://127.0.0.1:2500");
         const req = try client.fetch(.{ .method = .GET, .location = .{ .uri = uri } });
 
         try testing.expectEqual(std.http.Status.ok, req.status);
