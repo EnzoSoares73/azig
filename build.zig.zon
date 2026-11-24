@@ -2,11 +2,11 @@
     .name = .azig,
     .version = "1.0.0",
     .fingerprint = 0x9c5186e98ff1b9bc,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .libuv = .{
-            .url = "git+https://github.com/allyourcodebase/libuv.git?ref=v1.51.0#42b4759ef96ea7ca892f8e90ccf71065a435f99a",
-            .hash = "libuv-1.51.0-htqqvwFnAACFBo-O65-KUmJ_eLGiFylpkBBvlSgKYgba",
+            .url = "git+https://github.com/allyourcodebase/libuv.git?ref=v1.53.0#20d7e88ae35abcd0256dcbbe081064cbd4794bb3",
+            .hash = "libuv-1.53.0-htqqv09uAAARV-6ZqCVoCzfQ9y0UnGaUXEnkcmgbWgCW",
         },
     },
     .paths = .{

@@ -1,16 +1,6 @@
 const std = @import("std");
 
-pub const HttpError = error{
-BadRequest,
-Unauthorized,
-Forbidden,
-NotFound,
-MethodNotAllowed,
-RequestTimeout,
-PayloadTooLarge,
-InternalServerError,
-HTTPVersionNotSupported
-};
+pub const HttpError = error{ BadRequest, Unauthorized, Forbidden, NotFound, MethodNotAllowed, RequestTimeout, PayloadTooLarge, RequestHeaderFieldsTooLarge, InternalServerError, HttpVersionNotSupported };
 
 pub fn errorToStatusCode(err: HttpError) u16 {
     return switch (err) {
@@ -21,8 +11,9 @@ pub fn errorToStatusCode(err: HttpError) u16 {
         HttpError.MethodNotAllowed => 405,
         HttpError.RequestTimeout => 408,
         HttpError.PayloadTooLarge => 413,
+        HttpError.RequestHeaderFieldsTooLarge => 431,
         HttpError.InternalServerError => 500,
-        HttpError.HTTPVersionNotSupported => 505
+        HttpError.HttpVersionNotSupported => 505,
     };
 }
 
@@ -38,6 +29,7 @@ pub fn statusCodeToMessage(code: u16) ?[]const u8 {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Payload too Large",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         505 => "HTTP Version Not Supported",
         else => null,
@@ -45,9 +37,11 @@ pub fn statusCodeToMessage(code: u16) ?[]const u8 {
 }
 
 pub fn toHttpError(err: anyerror, default_err: HttpError) HttpError {
-    for (std.meta.fields(HttpError)) |http_error| {
-        if (std.mem.eql(u8, http_error.name, @errorName(err))) {
-            return @errorCast(err);
+    // Compares error values directly (no string comparison): the loop is unrolled at
+    // compile time over the members of HttpError.
+    inline for (@typeInfo(HttpError).error_set.error_names.?) |name| {
+        if (err == @field(anyerror, name)) {
+            return @field(HttpError, name);
         }
     }
     return default_err;

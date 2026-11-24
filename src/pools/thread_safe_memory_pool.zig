@@ -1,6 +1,6 @@
 const std = @import("std");
-const Options = std.heap.MemoryPoolOptions;
-const Mutex = std.Thread.Mutex;
+const Options = std.heap.memory_pool.Options;
+const Mutex = @import("spin_lock.zig").SpinLock;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
@@ -19,7 +19,7 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
 
         arena: std.heap.ArenaAllocator,
         free_list: std.SinglyLinkedList,
-        mutex: std.Thread.Mutex,
+        mutex: Mutex,
 
         pub const item_size = @max(@sizeOf(Node), @sizeOf(Item));
 

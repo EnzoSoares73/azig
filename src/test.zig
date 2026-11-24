@@ -5,6 +5,9 @@ test {
     _ = @import("response.zig");
     _ = @import("request.zig");
     _ = @import("action.zig");
+    _ = @import("pools/map_pool.zig");
+    _ = @import("header.zig");
+    _ = @import("pools/spin_lock.zig");
 
     std.testing.refAllDecls(@This());
 }

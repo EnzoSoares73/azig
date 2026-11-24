@@ -1,11 +1,11 @@
 const constants = @import("constants.zig");
 
 pub const Config = struct {
-    port: u16 = constants.DEFAULT_PORT,
-    pool_size: u16 = constants.DEFAULT_POOL_SIZE,
-    timeout: u64 = constants.DEFAULT_INACTIVITY_TIMEOUT,
-    backlog_size: u16 = constants.DEFAULT_BACKLOG_SIZE,
-    listen_address: []const u8 = constants.DEFAULT_LISTEN_ADDRESS,
-    max_payload_size: u64 = constants.DEFAULT_MAX_PAYLOAD_SIZE,
-    allowed_methods: []const []const u8 = constants.DEFAULT_ALLOWED_METHODS,
+    port: u16 = constants.default_port,
+    pool_size: u16 = constants.default_pool_size,
+    timeout: u64 = constants.default_inactivity_timeout,
+    backlog_size: u16 = constants.default_backlog_size,
+    listen_address: []const u8 = constants.default_listen_address,
+    max_payload_size: u64 = constants.default_max_payload_size,
+    allowed_methods: []const []const u8 = constants.default_allowed_methods,
 };

@@ -2,3 +2,4 @@
 .idea
 zig-out
 vcpkg
+zig-pkg

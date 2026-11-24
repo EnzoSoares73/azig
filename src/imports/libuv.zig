@@ -69712,8 +69712,8 @@ pub extern fn uv_check_stop(check: [*c]uv_check_t) c_int;
 pub extern fn uv_idle_init([*c]uv_loop_t, idle: [*c]uv_idle_t) c_int;
 pub extern fn uv_idle_start(idle: [*c]uv_idle_t, cb: uv_idle_cb) c_int;
 pub extern fn uv_idle_stop(idle: [*c]uv_idle_t) c_int;
-pub extern fn uv_async_init([*c]uv_loop_t, @"async": [*c]uv_async_t, async_cb: uv_async_cb) c_int;
-pub extern fn uv_async_send(@"async": [*c]uv_async_t) c_int;
+pub extern fn uv_async_init([*c]uv_loop_t, async: [*c]uv_async_t, async_cb: uv_async_cb) c_int;
+pub extern fn uv_async_send(async: [*c]uv_async_t) c_int;
 pub extern fn uv_timer_init([*c]uv_loop_t, handle: [*c]uv_timer_t) c_int;
 pub extern fn uv_timer_start(handle: [*c]uv_timer_t, cb: uv_timer_cb, timeout: u64, repeat: u64) c_int;
 pub extern fn uv_timer_stop(handle: [*c]uv_timer_t) c_int;
@@ -70023,7 +70023,7 @@ pub extern fn uv_thread_equal(t1: [*c]const uv_thread_t, t2: [*c]const uv_thread
 pub extern fn uv_thread_setname(name: [*c]const u8) c_int;
 pub extern fn uv_thread_getname(tid: [*c]uv_thread_t, name: [*c]u8, size: usize) c_int;
 pub const union_uv_any_handle = extern union {
-    @"async": uv_async_t,
+    async: uv_async_t,
     check: uv_check_t,
     fs_event: uv_fs_event_t,
     fs_poll: uv_fs_poll_t,

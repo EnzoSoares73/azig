@@ -1,12 +1,11 @@
-const request_t = @import("request.zig").request_t;
+const GenericRequest = @import("request.zig").GenericRequest;
 const Response = @import("response.zig").Response;
-const middleware_t = @import("constants.zig").middleware_t;
-const callback_t = @import("constants.zig").callback_t;
+const Middleware = @import("constants.zig").Middleware;
+const Callback = @import("constants.zig").Callback;
 
-
-pub fn action_t(comptime AppContext: type, comptime RequestContext: type) type {
-    const Request = request_t(RequestContext);
-    const callback_fn = callback_t(AppContext, RequestContext);
+pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) type {
+    const Request = GenericRequest(RequestContext);
+    const CallbackFn = Callback(AppContext, RequestContext);
 
     return struct {
         const Self = @This();
@@ -15,8 +14,8 @@ pub fn action_t(comptime AppContext: type, comptime RequestContext: type) type {
         response: *Response,
         index: u8,
         app_context: *AppContext,
-        middleware_list: []const middleware_t(AppContext, RequestContext),
-        callback: callback_fn,
+        middleware_list: []const Middleware(AppContext, RequestContext),
+        callback: CallbackFn,
 
         pub fn next(self: Self) !void {
             if (self.index == self.middleware_list.len) {
@@ -47,10 +46,10 @@ pub fn action_t(comptime AppContext: type, comptime RequestContext: type) type {
 
 const std = @import("std");
 const testing = std.testing;
-const map_t = @import("constants.zig").map_t;
-const ALLOWED_METHODS: *const [6][]const u8 = &.{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"};
+const StringMapPool = @import("constants.zig").StringMapPool;
+const test_allowed_methods: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
 
-test "action_t with void AppContext calls callback when no middlewares" {
+test "GenericAction with void AppContext calls callback when no middlewares" {
     const TestRequestContext = void;
     const AppContext = void;
 
@@ -58,11 +57,11 @@ test "action_t with void AppContext calls callback when no middlewares" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = map_t.init(allocator);
+    var map_pool = StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
-    const Request = request_t(TestRequestContext);
+    const Request = GenericRequest(TestRequestContext);
     var request = try Request.init(&map_pool);
 
     const request_raw: []const u8 =
@@ -73,16 +72,16 @@ test "action_t with void AppContext calls callback when no middlewares" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request, ALLOWED_METHODS);
+    try request.parseRequest(mutable_request, test_allowed_methods);
 
-    const Callback = callback_t(AppContext, TestRequestContext);
-    const callback: Callback = struct {
+    const CallbackFn = Callback(AppContext, TestRequestContext);
+    const callback: CallbackFn = struct {
         fn cb(inner_request: *Request, _: *Response) !void {
             inner_request.version = "HTTP/1.2";
         }
     }.cb;
 
-    var action = action_t(AppContext, TestRequestContext){
+    var action = GenericAction(AppContext, TestRequestContext){
         .request = &request,
         .response = &response,
         .index = 0,
@@ -97,21 +96,19 @@ test "action_t with void AppContext calls callback when no middlewares" {
 }
 
 test "should return early if middleware does not call next()" {
-    const TestRequestContext = struct {
-        counter: u8
-    };
+    const TestRequestContext = struct { counter: u8 };
     const AppContext = void;
-    const Action = action_t(AppContext, TestRequestContext);
+    const Action = GenericAction(AppContext, TestRequestContext);
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = map_t.init(allocator);
+    var map_pool = StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
-    const Request = request_t(TestRequestContext);
+    const Request = GenericRequest(TestRequestContext);
     var request = try Request.init(&map_pool);
     request.context.counter = 0;
 
@@ -123,10 +120,10 @@ test "should return early if middleware does not call next()" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request, ALLOWED_METHODS);
+    try request.parseRequest(mutable_request, test_allowed_methods);
 
-    const Callback = callback_t(AppContext, TestRequestContext);
-    const callback: Callback = struct {
+    const CallbackFn = Callback(AppContext, TestRequestContext);
+    const callback: CallbackFn = struct {
         fn cb(inner_request: *Request, _: *Response) !void {
             inner_request.context.counter = 2;
         }
@@ -139,7 +136,7 @@ test "should return early if middleware does not call next()" {
         }
     }.mw;
 
-    const middlewares = [_]middleware_t(AppContext, TestRequestContext){ middleware1 };
+    const middlewares = [_]Middleware(AppContext, TestRequestContext){middleware1};
 
     var action = Action{
         .request = &request,
@@ -155,21 +152,19 @@ test "should return early if middleware does not call next()" {
 }
 
 test "should call middlewares in order" {
-    const TestRequestContext = struct {
-        counter: u8
-    };
+    const TestRequestContext = struct { counter: u8 };
     const AppContext = void;
-    const Action = action_t(AppContext, TestRequestContext);
+    const Action = GenericAction(AppContext, TestRequestContext);
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = map_t.init(allocator);
+    var map_pool = StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
-    const Request = request_t(TestRequestContext);
+    const Request = GenericRequest(TestRequestContext);
     var request = try Request.init(&map_pool);
     request.context.counter = 0;
 
@@ -181,10 +176,10 @@ test "should call middlewares in order" {
 
     const mutable_request = try allocator.dupe(u8, request_raw);
     defer allocator.free(mutable_request);
-    try request.parse_request(mutable_request, ALLOWED_METHODS);
+    try request.parseRequest(mutable_request, test_allowed_methods);
 
-    const Callback = callback_t(AppContext, TestRequestContext);
-    const callback: Callback = struct {
+    const CallbackFn = Callback(AppContext, TestRequestContext);
+    const callback: CallbackFn = struct {
         fn cb(inner_request: *Request, _: *Response) !void {
             try testing.expectEqual(inner_request.context.counter, 2);
             inner_request.context.counter = 3;
@@ -211,7 +206,7 @@ test "should call middlewares in order" {
         }
     }.mw;
 
-    const middlewares = [_]middleware_t(AppContext, TestRequestContext){ middleware1, middleware2 };
+    const middlewares = [_]Middleware(AppContext, TestRequestContext){ middleware1, middleware2 };
 
     var action = Action{
         .request = &request,
@@ -226,7 +221,6 @@ test "should call middlewares in order" {
     try testing.expectEqual(request.context.counter, 5);
 }
 
-
 test "error raised by callback is captured" {
     const TestRequestContext = void;
     const AppContext = void;
@@ -235,21 +229,21 @@ test "error raised by callback is captured" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = map_t.init(allocator);
+    var map_pool = StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
-    const Request = request_t(TestRequestContext);
+    const Request = GenericRequest(TestRequestContext);
     var request = try Request.init(&map_pool);
 
-    const Callback = callback_t(AppContext, TestRequestContext);
-    const callback: Callback = struct {
+    const CallbackFn = Callback(AppContext, TestRequestContext);
+    const callback: CallbackFn = struct {
         fn cb(_: *Request, _: *Response) !void {
             return error.TestError;
         }
     }.cb;
 
-    var action = action_t(AppContext, TestRequestContext){
+    var action = GenericAction(AppContext, TestRequestContext){
         .request = &request,
         .response = &response,
         .index = 0,

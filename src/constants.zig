@@ -3,56 +3,51 @@ const Response = @import("response.zig").Response;
 const uv = @import("imports/libuv.zig");
 const ThreadSafeMemoryPool = @import("pools/thread_safe_memory_pool.zig").ThreadSafeMemoryPool;
 const MapPool = @import("pools/map_pool.zig").MapPool;
-const request_t = @import("request.zig").request_t;
-const action_t = @import("action.zig").action_t;
+const GenericRequest = @import("request.zig").GenericRequest;
+const GenericAction = @import("action.zig").GenericAction;
 
-pub const DEFAULT_PORT: u16 = 2500;
-pub const DEFAULT_POOL_SIZE: u16 = 1024;
-pub const DEFAULT_INACTIVITY_TIMEOUT: u64 = 15_000;
-pub const DEFAULT_BACKLOG_SIZE: u16 = 128;
-pub const DEFAULT_LISTEN_ADDRESS = "0.0.0.0";
-pub const DEFAULT_MAX_PAYLOAD_SIZE: u64 = 1_048_576;
-pub const DEFAULT_ALLOWED_METHODS: *const [6][]const u8 = &.{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"};
+pub const default_port: u16 = 2500;
+pub const default_pool_size: u16 = 1024;
+pub const default_inactivity_timeout: u64 = 15_000;
+pub const default_backlog_size: u16 = 128;
+pub const default_listen_address = "0.0.0.0";
+pub const default_max_payload_size: u64 = 1_048_576;
+pub const default_allowed_methods: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
 pub const suggested_buffer_size: usize = 65536;
+/// Minimum free space handed to libuv for each read. Reads go straight into the
+/// connection's read buffer, which grows past this only for large requests.
+pub const read_chunk_size: usize = 4096;
 
-pub fn callback_t(comptime AppContext: type, comptime RequestContext: type) type {
-    const Request = request_t(RequestContext);
+pub fn Callback(comptime AppContext: type, comptime RequestContext: type) type {
+    const Request = GenericRequest(RequestContext);
     if (AppContext == void) {
         return *const fn (*Request, *Response) anyerror!void;
     }
     return *const fn (*AppContext, *Request, *Response) anyerror!void;
 }
 
-pub fn middleware_t(comptime AppContext: type, comptime RequestContext: type) type {
-    const Request = request_t(RequestContext);
-    const Action = action_t(AppContext, RequestContext);
+pub fn Middleware(comptime AppContext: type, comptime RequestContext: type) type {
+    const Request = GenericRequest(RequestContext);
+    const Action = GenericAction(AppContext, RequestContext);
     if (AppContext == void)
         return *const fn (*Request, *Response, Action) anyerror!void
     else
         return *const fn (*AppContext, *Request, *Response, Action) anyerror!void;
 }
 
-pub const buffer_pool_t = ThreadSafeMemoryPool([suggested_buffer_size]u8, .{
+pub const ResponsePool = ThreadSafeMemoryPool(Response, .{
     .growable = true,
 });
 
-pub const response_pool_t = ThreadSafeMemoryPool(Response, .{
+pub const ClientPool = std.heap.MemoryPool(uv.uv_tcp_t);
+
+pub const WriteReqPool = std.heap.MemoryPool(uv.uv_write_t);
+
+pub const ArenaPool = ThreadSafeMemoryPool(std.heap.ArenaAllocator, .{
     .growable = true,
 });
 
-pub const client_pool_t = ThreadSafeMemoryPool(uv.uv_tcp_t, .{
-    .growable = true,
-});
-
-pub const write_req_pool_t = ThreadSafeMemoryPool(uv.uv_write_t, .{
-    .growable = true,
-});
-
-pub const arena_pool_t = ThreadSafeMemoryPool(std.heap.ArenaAllocator, .{
-    .growable = true,
-});
-
-pub const map_t = MapPool(.{
+pub const StringMapPool = MapPool(.{
     .growable = true,
 });
 

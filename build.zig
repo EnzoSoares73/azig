@@ -33,9 +33,7 @@ pub fn build(b: *std.Build) !void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
@@ -48,7 +46,6 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     unit_tests.root_module.linkLibrary(libuv_dep.artifact("uv"));
-    run_step.dependOn(&run_cmd.step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
