@@ -1601,6 +1601,9 @@ const Fiber = struct {
         if (is_windows) {
             win.DeleteFiber(fiber.platform);
         } else {
+            // In debug builds `free` overwrites the whole slice with 0xAA, which faults on the
+            // PROT_NONE guard page: make it writable again first.
+            setGuardPage(fiber.platform.stack, .{ .READ = true, .WRITE = true });
             std.heap.page_allocator.free(fiber.platform.stack);
         }
     }
@@ -1699,10 +1702,14 @@ const Fiber = struct {
     fn protectGuardPage(stack: []align(std.heap.page_size_min) u8) void {
         // The stack grows down: an overflow hits the lowest page and faults instead of
         // corrupting whatever memory comes before the stack.
+        setGuardPage(stack, .{});
+    }
+
+    fn setGuardPage(stack: []align(std.heap.page_size_min) u8, prot: std.posix.PROT) void {
         if (builtin.link_libc) {
-            _ = std.c.mprotect(@ptrCast(stack.ptr), std.heap.pageSize(), .{});
+            _ = std.c.mprotect(@ptrCast(stack.ptr), std.heap.pageSize(), prot);
         } else if (builtin.os.tag == .linux) {
-            _ = std.os.linux.mprotect(stack.ptr, std.heap.pageSize(), .{});
+            _ = std.os.linux.mprotect(stack.ptr, std.heap.pageSize(), prot);
         }
     }
 };
