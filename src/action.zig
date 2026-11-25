@@ -1,3 +1,4 @@
+const std = @import("std");
 const GenericRequest = @import("request.zig").GenericRequest;
 const Response = @import("response.zig").Response;
 const Middleware = @import("constants.zig").Middleware;
@@ -10,6 +11,7 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
     return struct {
         const Self = @This();
 
+        io: std.Io,
         request: *Request,
         response: *Response,
         index: u8,
@@ -20,13 +22,14 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
         pub fn next(self: Self) !void {
             if (self.index == self.middleware_list.len) {
                 if (AppContext == void) {
-                    try self.callback(self.request, self.response);
+                    try self.callback(self.io, self.request, self.response);
                 } else {
-                    try self.callback(self.app_context, self.request, self.response);
+                    try self.callback(self.app_context, self.io, self.request, self.response);
                 }
             } else {
                 const middleware = self.middleware_list[self.index];
                 const action: Self = .{
+                    .io = self.io,
                     .index = self.index + 1,
                     .request = self.request,
                     .response = self.response,
@@ -35,16 +38,15 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
                     .callback = self.callback,
                 };
                 if (AppContext == void) {
-                    try middleware(self.request, self.response, action);
+                    try middleware(self.io, self.request, self.response, action);
                 } else {
-                    try middleware(self.app_context, self.request, self.response, action);
+                    try middleware(self.app_context, self.io, self.request, self.response, action);
                 }
             }
         }
     };
 }
 
-const std = @import("std");
 const testing = std.testing;
 const StringMapPool = @import("constants.zig").StringMapPool;
 const test_allowed_methods: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
@@ -76,12 +78,13 @@ test "GenericAction with void AppContext calls callback when no middlewares" {
 
     const CallbackFn = Callback(AppContext, TestRequestContext);
     const callback: CallbackFn = struct {
-        fn cb(inner_request: *Request, _: *Response) !void {
+        fn cb(_: std.Io, inner_request: *Request, _: *Response) !void {
             inner_request.version = "HTTP/1.2";
         }
     }.cb;
 
     var action = GenericAction(AppContext, TestRequestContext){
+        .io = testing.io,
         .request = &request,
         .response = &response,
         .index = 0,
@@ -124,13 +127,13 @@ test "should return early if middleware does not call next()" {
 
     const CallbackFn = Callback(AppContext, TestRequestContext);
     const callback: CallbackFn = struct {
-        fn cb(inner_request: *Request, _: *Response) !void {
+        fn cb(_: std.Io, inner_request: *Request, _: *Response) !void {
             inner_request.context.counter = 2;
         }
     }.cb;
 
     const middleware1 = struct {
-        fn mw(inner_request: *Request, _: *Response, _: Action) !void {
+        fn mw(_: std.Io, inner_request: *Request, _: *Response, _: Action) !void {
             try testing.expectEqual(inner_request.context.counter, 0);
             inner_request.context.counter = 1;
         }
@@ -139,6 +142,7 @@ test "should return early if middleware does not call next()" {
     const middlewares = [_]Middleware(AppContext, TestRequestContext){middleware1};
 
     var action = Action{
+        .io = testing.io,
         .request = &request,
         .response = &response,
         .index = 0,
@@ -180,14 +184,14 @@ test "should call middlewares in order" {
 
     const CallbackFn = Callback(AppContext, TestRequestContext);
     const callback: CallbackFn = struct {
-        fn cb(inner_request: *Request, _: *Response) !void {
+        fn cb(_: std.Io, inner_request: *Request, _: *Response) !void {
             try testing.expectEqual(inner_request.context.counter, 2);
             inner_request.context.counter = 3;
         }
     }.cb;
 
     const middleware1 = struct {
-        fn mw(inner_request: *Request, _: *Response, action: Action) !void {
+        fn mw(_: std.Io, inner_request: *Request, _: *Response, action: Action) !void {
             try testing.expectEqual(inner_request.context.counter, 0);
             inner_request.context.counter = 1;
             try action.next();
@@ -197,7 +201,7 @@ test "should call middlewares in order" {
     }.mw;
 
     const middleware2 = struct {
-        fn mw(inner_request: *Request, _: *Response, action: Action) !void {
+        fn mw(_: std.Io, inner_request: *Request, _: *Response, action: Action) !void {
             try testing.expectEqual(inner_request.context.counter, 1);
             inner_request.context.counter = 2;
             try action.next();
@@ -209,6 +213,7 @@ test "should call middlewares in order" {
     const middlewares = [_]Middleware(AppContext, TestRequestContext){ middleware1, middleware2 };
 
     var action = Action{
+        .io = testing.io,
         .request = &request,
         .response = &response,
         .index = 0,
@@ -238,12 +243,13 @@ test "error raised by callback is captured" {
 
     const CallbackFn = Callback(AppContext, TestRequestContext);
     const callback: CallbackFn = struct {
-        fn cb(_: *Request, _: *Response) !void {
+        fn cb(_: std.Io, _: *Request, _: *Response) !void {
             return error.TestError;
         }
     }.cb;
 
     var action = GenericAction(AppContext, TestRequestContext){
+        .io = testing.io,
         .request = &request,
         .response = &response,
         .index = 0,

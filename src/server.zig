@@ -20,6 +20,8 @@ const HttpError = @import("http_error.zig").HttpError;
 const toHttpError = @import("http_error.zig").toHttpError;
 
 const Mutex = @import("pools/mutex.zig").Mutex;
+const Libuv = @import("libuv_io.zig").Libuv;
+const Task = @import("libuv_io.zig").Task;
 const logger = std.log.scoped(.server);
 
 /// Largest accepted request head (request line + headers). Larger heads get a 431.
@@ -31,8 +33,8 @@ const max_retained_buffer_size: usize = suggested_buffer_size;
 pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = GenericRequest(RequestContext);
 
-    // Requests are created and released on the loop thread only (the worker thread uses a
-    // request, but never creates or destroys one).
+    // Requests are created and released on the loop's own context only (the handler task uses
+    // a request, but never creates or destroys one).
     const RequestPool = std.heap.MemoryPool(Request);
 
     const State = struct {
@@ -51,16 +53,17 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         /// Total length (head + body) of the request being processed.
         request_len: usize,
         request: ?*Request,
-        /// Set by the worker thread in `process`, consumed in `afterProcess`.
+        /// Set by the handler task in `process`, consumed in `afterProcess`.
         response: ?*Response,
-        req: uv.uv_work_t,
+        /// The task running the handler; valid while `processing`.
+        task: ?Task,
         /// Serialized response. It must not be touched while `writing`; afterwards it is
         /// cleared, keeping its capacity for the next response on this connection.
         write_buf: std.ArrayList(u8),
         /// True while a write is in flight.
         writing: bool,
         keep_alive: bool,
-        /// True while the request is queued on / running in the thread pool.
+        /// True while a handler task runs for the request.
         processing: bool,
         closing: bool,
         /// The handler exceeded the timeout and a 408 was sent in its place.
@@ -91,6 +94,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         map_allocator: *StringMapPool,
         app_context: *AppContext,
         middleware_list: []const MiddlewareFn,
+        /// Runs the handlers, as fibers on the event loop.
+        lio: *Libuv,
         timeout: u64,
         max_payload_size: u64,
         allowed_methods: []const []const u8,
@@ -125,6 +130,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             BindFailed,
             ListenFailed,
             StopSignalInitFailed,
+            IoInitFailed,
         };
 
         /// Call `deinit` once the server is no longer used (after `start()` has returned).
@@ -177,6 +183,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             // bind error), lets every close callback and in-flight request finish, then
             // closes the loop.
             defer closeLoop(&loop);
+
+            // The Io the handlers run on. Its deinit runs before closeLoop (defers run in
+            // reverse), once uv_run has returned, i.e. once every handler task has finished.
+            var lio: Libuv = undefined;
+            lio.init(allocator, &loop, .{ .stack_size = config.task_stack_size }) catch |err| {
+                logger.warn("Failed to initialize the Io: {}", .{err});
+                return error.IoInitFailed;
+            };
+            defer lio.deinit();
+            ctx.*.lio = &lio;
 
             var server: uv.uv_tcp_t = undefined;
             try uvCheck(uv.uv_tcp_init(&loop, &server), "initialize the server handle", error.ServerInitFailed);
@@ -261,8 +277,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         // Runs on the loop thread when stop() is called. Stops accepting connections and closes
-        // every open connection. uv_run then returns once all close callbacks have run and the
-        // requests still in the thread pool have finished (afterProcess frees their state).
+        // every open connection, which cancels the handlers still running. uv_run then returns
+        // once all close callbacks have run and every handler task has finished (afterProcess
+        // frees their state).
         fn onStopSignal(handle: [*c]uv.uv_async_t) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(handle.*.data));
 
@@ -317,12 +334,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             self.middleware_list = middleware_list;
         }
 
-        // Connection lifecycle (all of this runs on the loop thread, except `process`):
+        // Connection lifecycle (all of this runs on the loop's own context, except `process`, which
+        // runs as a task: a fiber on the same thread):
         //
         //   reading ──(request complete)──> processing ──(afterProcess)──> writing ──(keep-alive)──> reading
         //
-        // - While processing, reading and the inactivity timer are stopped, so the worker thread has
-        //   exclusive access to the request and its buffer.
+        // - While processing, reading is stopped, so the handler task has exclusive access to the
+        //   request and its buffer.
         // - The serialized response is in `state.write_buf`, which must not be touched while `state.writing`.
         // - A connection owns two libuv handles (the TCP stream and the timer). Both must be closed,
         //   and no work or write may be pending, before the state can be returned to the pool.
@@ -358,7 +376,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .request_len = 0,
                 .request = null,
                 .response = null,
-                .req = undefined,
+                .task = null,
                 .write_buf = .empty,
                 .writing = false,
                 .keep_alive = false,
@@ -452,18 +470,17 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
-        fn afterProcess(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
-            const state: *State = @ptrCast(@alignCast(req.*.data));
+        /// Runs on the loop's own context once the handler task has finished.
+        fn afterProcess(arg: *anyopaque) void {
+            const state: *State = @ptrCast(@alignCast(arg));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             state.*.processing = false;
+            state.*.task = null;
             const response = state.*.response;
             state.*.response = null;
 
-            if (status < 0) {
-                logger.debug("Operation cancelled", .{});
-                closeConnection(state);
-            } else if (!state.*.closing and !state.*.timed_out) {
+            if (!state.*.closing and !state.*.timed_out) {
                 // No timeouts while the response is being written; onWriteComplete
                 // restarts the timer for keep-alive connections.
                 _ = uv.uv_timer_stop(&state.*.timer);
@@ -490,8 +507,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
-        fn process(req: [*c]uv.uv_work_t) callconv(.c) void {
-            const state: *State = @ptrCast(@alignCast(req.*.data));
+        /// The handler task. Runs as a fiber on the loop thread, so it can wait (through the Io
+        /// it passes to the handler) without blocking the loop.
+        fn process(arg: *anyopaque) void {
+            const state: *State = @ptrCast(@alignCast(arg));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             const request = state.*.request.?;
@@ -510,6 +529,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
         fn handleCallback(ctx: *Context, request: *Request, response: *Response) void {
             const action: Action = .{
+                .io = ctx.*.lio.io(),
                 .app_context = ctx.*.app_context,
                 .index = 0,
                 .middleware_list = ctx.*.middleware_list,
@@ -605,7 +625,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         const DispatchResult = enum {
-            /// A complete request was handed to the thread pool.
+            /// A complete request was handed to a handler task.
             dispatched,
             /// The buffered bytes don't hold a complete request yet.
             need_more,
@@ -614,7 +634,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         };
 
         /// Looks at the buffered bytes and, once they hold a complete request, parses it and
-        /// queues it on the thread pool. Bytes after the request (a pipelined request) stay in
+        /// starts a handler task for it. Bytes after the request (a pipelined request) stay in
         /// the buffer and are looked at once the response has been written.
         fn tryDispatch(state: *State) DispatchResult {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
@@ -691,21 +711,20 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 };
             }
 
-            // The worker thread now owns the request: stop reading so no new data can touch it
+            // The handler task now owns the request: stop reading so no new data can touch it
             // (reading restarts once the response has been written, see onWriteComplete).
             // The timer is restarted to give the handler the full timeout: if it takes longer,
-            // the client gets a 408 (see onTimeout).
+            // the client gets a 408 and the task is canceled (see onTimeout).
             stopReading(state);
-            _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
 
-            state.*.req.data = @ptrCast(state);
-            state.*.processing = true;
-            const res = uv.uv_queue_work(state.*.stream.*.loop, @ptrCast(@alignCast(&state.*.req)), process, afterProcess);
-            if (res != 0) {
-                state.*.processing = false;
-                closeConnection(state);
+            state.*.task = ctx.*.lio.spawnDetached(process, afterProcess, state) catch {
+                logger.err("Failed to start a handler task", .{});
+                discardRequest(state);
+                setResponseAndSend(state, 503);
                 return .failed;
-            }
+            };
+            state.*.processing = true;
+            _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
             return .dispatched;
         }
 
@@ -862,11 +881,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const state: *State = @ptrCast(@alignCast(timer.*.data));
 
             if (state.*.processing) {
-                // The handler is taking too long. Answer 408 now and close the connection once
-                // it is written. The worker still owns the request, so it is left alone:
-                // afterProcess drops the handler's response and releases the request.
+                // The handler is taking too long. Answer 408 now, close the connection once it
+                // is written, and cancel the handler: its next cancelation point (or the one it
+                // is waiting in) returns error.Canceled. The task still owns the request, so it
+                // is left alone: afterProcess drops the handler's response and releases it.
                 logger.debug("Request handler exceeded the timeout", .{});
                 state.*.timed_out = true;
+                const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+                ctx.*.lio.cancelTask(state.*.task.?);
                 setResponseAndSend(state, 408);
                 return;
             }
@@ -878,10 +900,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         /// Starts closing both handles owned by the connection. The state is freed once
-        /// both close callbacks have run and no work or write is pending.
+        /// both close callbacks have run and no handler task or write is pending.
         fn closeConnection(state: *State) void {
             if (state.*.closing) return;
             state.*.closing = true;
+
+            // Nobody is left to receive the response: cancel the handler, if one is running.
+            if (state.*.processing) {
+                const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+                ctx.*.lio.cancelTask(state.*.task.?);
+            }
 
             _ = uv.uv_timer_stop(&state.*.timer);
             uv.uv_close(@ptrCast(@alignCast(state.*.stream)), onHandleClosed);
@@ -1009,7 +1037,7 @@ test "start returns an error when the port is already in use" {
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(_: *Request, _: *Response) !void {}
+        fn onResponse(_: std.Io, _: *Request, _: *Response) !void {}
     }.onResponse;
 
     const run = struct {
@@ -1047,7 +1075,7 @@ test "stop called before start makes start return" {
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(_: *Request, _: *Response) !void {}
+        fn onResponse(_: std.Io, _: *Request, _: *Response) !void {}
     }.onResponse;
 
     var server = try TestServer.init(allocator, .{ .port = 2602 }, onResponse, {});
@@ -1066,7 +1094,7 @@ test "testing server" {
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(request: *Request, response: *Response) !void {
+        fn onResponse(_: std.Io, request: *Request, response: *Response) !void {
             if (std.mem.eql(u8, request.path, "/")) {
                 response.*.body = "Home Page";
                 try response.*.addHeader("Content-Type", "text/plain");
@@ -1284,8 +1312,8 @@ test "should handle mid-request timeout gracefully" {
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(_: *Request, _: *Response) !void {
-            try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(200) }, std.testing.io);
+        fn onResponse(io: std.Io, _: *Request, _: *Response) !void {
+            try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(200) }, io);
         }
     }.onResponse;
 
@@ -1329,11 +1357,15 @@ test "should handle mid-request timeout gracefully, where afterProcess is called
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(_: *Request, _: *Response) !void {
+        fn onResponse(io: std.Io, _: *Request, _: *Response) !void {
             // Slightly longer than the 100 ms timeout: the 408 is sent while the handler is still
             // running, and the handler finishes right around the time that write completes and
             // the connection is closed, so afterProcess can run before the close callbacks.
-            try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(110) }, std.testing.io);
+            // The timeout cancels the handler, so the sleep is protected from cancelation to
+            // keep it running until then.
+            const old = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(old);
+            std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(110) }, io) catch unreachable;
         }
     }.onResponse;
 
@@ -1377,7 +1409,7 @@ test "should enforce max_payload_size limit" {
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(_: *Request, _: *Response) !void {}
+        fn onResponse(_: std.Io, _: *Request, _: *Response) !void {}
     }.onResponse;
 
     const run = struct {
@@ -1432,14 +1464,14 @@ test "should call middlewares in order" {
     defer _ = gpa.deinit();
 
     const onResponse = struct {
-        fn onResponse(request: *Request, _: *Response) !void {
+        fn onResponse(_: std.Io, request: *Request, _: *Response) !void {
             try testing.expectEqual(request.context.counter, 3);
             request.context.counter = 4;
         }
     }.onResponse;
 
     const mid1 = struct {
-        fn mid(request: *Request, _: *Response, action: Action) !void {
+        fn mid(_: std.Io, request: *Request, _: *Response, action: Action) !void {
             request.context.counter = 1;
             try action.next();
             try testing.expectEqual(request.context.counter, 6);
@@ -1448,7 +1480,7 @@ test "should call middlewares in order" {
     }.mid;
 
     const mid2 = struct {
-        fn mid(request: *Request, _: *Response, action: Action) !void {
+        fn mid(_: std.Io, request: *Request, _: *Response, action: Action) !void {
             try testing.expectEqual(request.context.counter, 1);
             request.context.counter = 2;
             try action.next();
@@ -1458,7 +1490,7 @@ test "should call middlewares in order" {
     }.mid;
 
     const mid3 = struct {
-        fn mid(request: *Request, _: *Response, action: Action) !void {
+        fn mid(_: std.Io, request: *Request, _: *Response, action: Action) !void {
             try testing.expectEqual(request.context.counter, 2);
             request.context.counter = 3;
             try action.next();
@@ -1532,7 +1564,7 @@ const raw_client = struct {
 };
 
 /// Answers every request with "<path>:<body>", so responses show which request they belong to.
-fn echoPathAndBody(request: *GenericRequest(void), response: *Response) !void {
+fn echoPathAndBody(_: std.Io, request: *GenericRequest(void), response: *Response) !void {
     response.body = try std.fmt.allocPrint(response.arena.allocator(), "{s}:{s}", .{ request.path, request.body orelse "" });
 }
 
@@ -1678,4 +1710,175 @@ test "bytes sent after an inactivity timeout are ignored and the server keeps se
         defer allocator.free(expected);
         try testing.expectEqualStrings(expected, received);
     }
+}
+
+fn sleepMs(io: std.Io, ms: i64) std.Io.Cancelable!void {
+    return std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(ms) }, io);
+}
+
+fn msSince(start: std.Io.Clock.Timestamp) i64 {
+    return start.untilNow(raw_client.io).raw.toMilliseconds();
+}
+
+test "slow handlers do not stall the server" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const handler = struct {
+        fn handler(io: std.Io, request: *GenericRequest(void), response: *Response) !void {
+            // Stands in for a slow database query.
+            if (mem.eql(u8, request.path, "/slow")) try sleepMs(io, 600);
+            response.body = request.path;
+        }
+    }.handler;
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    // Far more slow requests than libuv's thread pool (4 threads) used to handle at once.
+    var slow_streams: [16]std.Io.net.Stream = undefined;
+    for (&slow_streams) |*stream| {
+        stream.* = try raw_client.connect(port);
+        try raw_client.send(stream.*, "GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    }
+    defer for (slow_streams) |stream| stream.close(raw_client.io);
+    raw_client.sleep(50);
+
+    // A fast request is answered while every slow one is still waiting.
+    {
+        const start = std.Io.Clock.Timestamp.now(raw_client.io, .awake);
+        const stream = try raw_client.connect(port);
+        defer stream.close(raw_client.io);
+        try raw_client.send(stream, "GET /fast HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        const received = try raw_client.receiveAll(stream, allocator);
+        defer allocator.free(received);
+        const expected = try raw_client.okResponse(allocator, "/fast");
+        defer allocator.free(expected);
+        try testing.expectEqualStrings(expected, received);
+        try testing.expect(msSince(start) < 400);
+    }
+
+    // And the slow ones all complete, about together.
+    const expected = try raw_client.okResponse(allocator, "/slow");
+    defer allocator.free(expected);
+    for (slow_streams) |stream| {
+        const received = try raw_client.receiveAll(stream, allocator);
+        defer allocator.free(received);
+        try testing.expectEqualStrings(expected, received);
+    }
+}
+
+test "handlers can run io.async tasks concurrently" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const handler = struct {
+        fn slowValue(io: std.Io, value: u32) std.Io.Cancelable!u32 {
+            try sleepMs(io, 200);
+            return value;
+        }
+
+        fn handler(io: std.Io, _: *GenericRequest(void), response: *Response) !void {
+            var a = io.async(slowValue, .{ io, 1 });
+            defer _ = a.cancel(io) catch {};
+            var b = io.async(slowValue, .{ io, 2 });
+            defer _ = b.cancel(io) catch {};
+            const sum = try a.await(io) + try b.await(io);
+            response.body = try std.fmt.allocPrint(response.arena.allocator(), "{d}", .{sum});
+        }
+    }.handler;
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    const start = std.Io.Clock.Timestamp.now(raw_client.io, .awake);
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    const received = try raw_client.receiveAll(stream, allocator);
+    defer allocator.free(received);
+    const expected = try raw_client.okResponse(allocator, "3");
+    defer allocator.free(expected);
+    try testing.expectEqualStrings(expected, received);
+    // The two 200 ms waits overlap.
+    try testing.expect(msSince(start) < 380);
+}
+
+var timed_out_handler_canceled = std.atomic.Value(bool).init(false);
+
+test "a handler that exceeds the timeout is canceled" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const handler = struct {
+        fn handler(io: std.Io, _: *GenericRequest(void), _: *Response) !void {
+            sleepMs(io, 60_000) catch |err| {
+                timed_out_handler_canceled.store(true, .release);
+                return err;
+            };
+        }
+    }.handler;
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, handler, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const received = try raw_client.receiveAll(stream, allocator);
+    defer allocator.free(received);
+    try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 408 "));
+
+    var attempts: usize = 0;
+    while (!timed_out_handler_canceled.load(.acquire) and attempts < 100) : (attempts += 1) raw_client.sleep(10);
+    try testing.expect(timed_out_handler_canceled.load(.acquire));
+}
+
+test "stop cancels the handlers still running" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const handler = struct {
+        fn handler(io: std.Io, _: *GenericRequest(void), _: *Response) !void {
+            try sleepMs(io, 60_000);
+        }
+    }.handler;
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    const port = try waitUntilListening(&server);
+
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    raw_client.sleep(100);
+
+    // Without cancelation, start() would only return once the 60 s handler had finished.
+    const start = std.Io.Clock.Timestamp.now(raw_client.io, .awake);
+    server.stop();
+    thread.join();
+    try testing.expect(msSince(start) < 2000);
 }

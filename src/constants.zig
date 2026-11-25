@@ -12,6 +12,8 @@ pub const default_inactivity_timeout: u64 = 15_000;
 pub const default_backlog_size: u16 = 128;
 pub const default_listen_address = "0.0.0.0";
 pub const default_max_payload_size: u64 = 1_048_576;
+/// Stack size of each request handler (handlers run as fibers on the event loop).
+pub const default_task_stack_size: usize = 4 * 1024 * 1024;
 pub const default_allowed_methods: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
 pub const suggested_buffer_size: usize = 65536;
 /// Minimum free space handed to libuv for each read. Reads go straight into the
@@ -21,18 +23,18 @@ pub const read_chunk_size: usize = 4096;
 pub fn Callback(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = GenericRequest(RequestContext);
     if (AppContext == void) {
-        return *const fn (*Request, *Response) anyerror!void;
+        return *const fn (std.Io, *Request, *Response) anyerror!void;
     }
-    return *const fn (*AppContext, *Request, *Response) anyerror!void;
+    return *const fn (*AppContext, std.Io, *Request, *Response) anyerror!void;
 }
 
 pub fn Middleware(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = GenericRequest(RequestContext);
     const Action = GenericAction(AppContext, RequestContext);
     if (AppContext == void)
-        return *const fn (*Request, *Response, Action) anyerror!void
+        return *const fn (std.Io, *Request, *Response, Action) anyerror!void
     else
-        return *const fn (*AppContext, *Request, *Response, Action) anyerror!void;
+        return *const fn (*AppContext, std.Io, *Request, *Response, Action) anyerror!void;
 }
 
 pub const ResponsePool = ThreadSafeMemoryPool(Response, .{

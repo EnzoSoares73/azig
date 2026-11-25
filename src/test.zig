@@ -8,6 +8,7 @@ test {
     _ = @import("pools/map_pool.zig");
     _ = @import("header.zig");
     _ = @import("pools/mutex.zig");
+    _ = @import("libuv_io.zig");
 
     std.testing.refAllDecls(@This());
 }

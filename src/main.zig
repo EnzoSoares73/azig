@@ -13,4 +13,4 @@ pub fn main() !void {
     try server.start();
 }
 
-fn onResponse(_: *azig.Request, _: *azig.Response) !void {}
+fn onResponse(_: std.Io, _: *azig.Request, _: *azig.Response) !void {}
