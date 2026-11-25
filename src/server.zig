@@ -110,6 +110,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         mutex: SpinLock = .init,
         stop_signal: ?*uv.uv_async_t = null,
         stop_requested: bool = false,
+        /// The port actually bound while the server is listening (resolves `.port = 0` to the
+        /// port the OS picked), 0 otherwise. Guarded by `mutex`; read it with `listeningPort()`.
+        bound_port: u16 = 0,
         // Only accessed from the loop thread.
         listener: ?*uv.uv_tcp_t = null,
 
@@ -182,6 +185,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             try uvCheck(uv.uv_tcp_bind(&server, @ptrCast(&addr), 0), "bind the server", error.BindFailed);
             try uvCheck(uv.uv_listen(@ptrCast(&server), config.backlog_size, onConnection), "listen", error.ListenFailed);
 
+            // With `.port = 0` the OS picks the port, so read back what was actually bound.
+            var bound_port = config.port;
+            {
+                var bound_addr: uv.struct_sockaddr_in = undefined;
+                var bound_len: c_int = @sizeOf(uv.struct_sockaddr_in);
+                if (uv.uv_tcp_getsockname(&server, @ptrCast(&bound_addr), &bound_len) == 0) {
+                    bound_port = mem.bigToNative(u16, bound_addr.sin_port);
+                }
+            }
+
             var stop_signal: uv.uv_async_t = undefined;
             try uvCheck(uv.uv_async_init(&loop, &stop_signal, onStopSignal), "initialize the stop signal", error.StopSignalInitFailed);
             stop_signal.data = self;
@@ -193,6 +206,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 self.stop_signal = &stop_signal;
+                self.bound_port = bound_port;
                 if (self.stop_requested) {
                     _ = uv.uv_async_send(&stop_signal);
                 }
@@ -200,13 +214,22 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             defer {
                 self.mutex.lock();
                 self.stop_signal = null;
+                self.bound_port = 0;
                 self.stop_requested = false;
                 self.mutex.unlock();
                 self.listener = null;
             }
 
-            logger.info("Server listening on {s}:{d}", .{ config.listen_address, config.port });
+            logger.info("Server listening on {s}:{d}", .{ config.listen_address, bound_port });
             _ = uv.uv_run(&loop, uv.UV_RUN_DEFAULT);
+        }
+
+        /// The port the server is listening on, or null if it is not (yet) listening. Safe to
+        /// call from any thread.
+        pub fn listeningPort(self: *Self) ?u16 {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return if (self.stop_signal != null) self.bound_port else null;
         }
 
         /// Asks the server to shut down. Safe to call from any thread, and before or while
@@ -960,14 +983,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
 const testing = std.testing;
 
-fn waitUntilListening(server: anytype) !void {
+/// Waits until the server is accepting connections and returns the port it is listening on.
+fn waitUntilListening(server: anytype) !u16 {
     var attempts: usize = 0;
     while (attempts < 500) : (attempts += 1) {
-        {
-            server.mutex.lock();
-            defer server.mutex.unlock();
-            if (server.stop_signal != null) return;
-        }
+        if (server.listeningPort()) |port| return port;
         std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(10) }, std.testing.io) catch {};
     }
     return error.ServerDidNotStart;
@@ -991,16 +1011,17 @@ test "start returns an error when the port is already in use" {
         }
     }.run;
 
-    var first = TestServer.init(allocator, .{ .port = 2601 }, onResponse, {});
+    var first = TestServer.init(allocator, .{ .port = 0 }, onResponse, {});
     const thread = try std.Thread.spawn(.{}, run, .{&first});
     defer {
         first.stop();
         thread.join();
     }
 
-    try waitUntilListening(&first);
+    const port = try waitUntilListening(&first);
 
-    var second = TestServer.init(allocator, .{ .port = 2601 }, onResponse, {});
+    var second = TestServer.init(allocator, .{}, onResponse, {});
+    second.config.port = port;
     if (second.start()) |_| {
         return error.TestUnexpectedResult;
     } else |err| {
@@ -1073,7 +1094,7 @@ test "testing server" {
         thread.join();
     }
 
-    try waitUntilListening(&server);
+    _ = try waitUntilListening(&server);
 
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
@@ -1274,7 +1295,7 @@ test "should handle mid-request timeout gracefully" {
         thread.join();
     }
 
-    try waitUntilListening(&server);
+    _ = try waitUntilListening(&server);
 
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
@@ -1321,7 +1342,7 @@ test "should handle mid-request timeout gracefully, where afterProcess is called
         thread.join();
     }
 
-    try waitUntilListening(&server);
+    _ = try waitUntilListening(&server);
 
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
@@ -1364,7 +1385,7 @@ test "should enforce max_payload_size limit" {
         thread.join();
     }
 
-    try waitUntilListening(&server);
+    _ = try waitUntilListening(&server);
 
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
@@ -1448,7 +1469,7 @@ test "should call middlewares in order" {
         thread.join();
     }
 
-    try waitUntilListening(&server);
+    _ = try waitUntilListening(&server);
 
     var client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
@@ -1509,15 +1530,15 @@ test "pipelined requests sent in a single write are answered in order" {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = Server(void, void).init(allocator, .{ .port = 2603 }, echoPathAndBody, {});
+    var server = Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
         server.stop();
         thread.join();
     }
-    raw_client.sleep(300);
+    const port = try waitUntilListening(&server);
 
-    const stream = try raw_client.connect(2603);
+    const stream = try raw_client.connect(port);
     defer stream.close(raw_client.io);
 
     // Four requests, one write: no body, Content-Length body, chunked body, and a last one
@@ -1545,15 +1566,15 @@ test "pipelined requests split across reads, including a large body, are answere
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = Server(void, void).init(allocator, .{ .port = 2604 }, echoPathAndBody, {});
+    var server = Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
         server.stop();
         thread.join();
     }
-    raw_client.sleep(300);
+    const port = try waitUntilListening(&server);
 
-    const stream = try raw_client.connect(2604);
+    const stream = try raw_client.connect(port);
     defer stream.close(raw_client.io);
 
     // Several times read_chunk_size, so the read buffer has to grow (and may move) while
@@ -1596,16 +1617,16 @@ test "bytes sent after an inactivity timeout are ignored and the server keeps se
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = Server(void, void).init(allocator, .{ .port = 2605, .timeout = 100 }, echoPathAndBody, {});
+    var server = Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, echoPathAndBody, {});
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
         server.stop();
         thread.join();
     }
-    raw_client.sleep(300);
+    const port = try waitUntilListening(&server);
 
     {
-        const stream = try raw_client.connect(2605);
+        const stream = try raw_client.connect(port);
         defer stream.close(raw_client.io);
 
         // An incomplete head, then silence: the server times out and answers 408.
@@ -1629,7 +1650,7 @@ test "bytes sent after an inactivity timeout are ignored and the server keeps se
 
     // A new connection is served normally.
     {
-        const stream = try raw_client.connect(2605);
+        const stream = try raw_client.connect(port);
         defer stream.close(raw_client.io);
         try raw_client.send(stream, "GET /after HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
 
