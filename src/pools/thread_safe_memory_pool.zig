@@ -1,10 +1,10 @@
 const std = @import("std");
 const Options = std.heap.memory_pool.Options;
-const Mutex = @import("mutex.zig").Mutex;
+const sync = @import("sync.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
-pub const MemoryPoolError = Mutex.InitError;
+pub const MemoryPoolError = Allocator.Error;
 
 pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options) type {
     if (pool_options.alignment) |a| {
@@ -19,7 +19,7 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
 
         arena: std.heap.ArenaAllocator,
         free_list: std.SinglyLinkedList,
-        mutex: Mutex,
+        mutex: std.Io.Mutex = .init,
 
         pub const item_size = @max(@sizeOf(Node), @sizeOf(Item));
 
@@ -29,7 +29,7 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         const ItemPtr = *align(item_alignment.toByteUnits()) Item;
 
         pub fn init(allocator: Allocator) MemoryPoolError!Pool {
-            return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = try Mutex.init(allocator), .free_list = .{} };
+            return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .free_list = .{} };
         }
 
         pub fn initPreheated(allocator: Allocator, initial_size: usize) MemoryPoolError!Pool {
@@ -40,7 +40,6 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         }
 
         pub fn deinit(pool: *Pool) void {
-            pool.mutex.deinit(pool.arena.child_allocator);
             pool.arena.deinit();
             pool.* = undefined;
         }
@@ -63,8 +62,8 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         }
 
         pub fn create(pool: *Pool) Allocator.Error!ItemPtr {
-            pool.*.mutex.lock();
-            defer pool.*.mutex.unlock();
+            pool.*.mutex.lockUncancelable(sync.io());
+            defer pool.*.mutex.unlock(sync.io());
 
             const ptr: ItemPtr = if (pool.free_list.popFirst()) |node|
                 @ptrCast(@alignCast(node))
@@ -78,8 +77,8 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         }
 
         pub fn destroy(pool: *Pool, ptr: ItemPtr) void {
-            pool.*.mutex.lock();
-            defer pool.*.mutex.unlock();
+            pool.*.mutex.lockUncancelable(sync.io());
+            defer pool.*.mutex.unlock(sync.io());
 
             ptr.* = undefined;
             pool.free_list.prepend(@ptrCast(ptr));

@@ -19,7 +19,7 @@ const errorToStatusCode = @import("http_error.zig").errorToStatusCode;
 const HttpError = @import("http_error.zig").HttpError;
 const toHttpError = @import("http_error.zig").toHttpError;
 
-const Mutex = @import("pools/mutex.zig").Mutex;
+const sync = @import("pools/sync.zig");
 const Libuv = @import("libuv_io.zig").Libuv;
 const Task = @import("libuv_io.zig").Task;
 const logger = std.log.scoped(.server);
@@ -112,7 +112,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         // loop directly: it wakes the loop thread through `stop_signal` (uv_async_send is the
         // only thread-safe libuv call). `mutex` guards both fields, so `stop()` can never send
         // on a handle that is closing or whose memory is gone.
-        mutex: Mutex,
+        mutex: std.Io.Mutex = .init,
         stop_signal: ?*uv.uv_async_t = null,
         stop_requested: bool = false,
         /// The port actually bound while the server is listening (resolves `.port = 0` to the
@@ -134,19 +134,17 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         };
 
         /// Call `deinit` once the server is no longer used (after `start()` has returned).
-        pub fn init(allocator: mem.Allocator, comptime config: Config, callback: CallbackFn, app_context: if (AppContext == void) void else *AppContext) Mutex.InitError!Self {
+        pub fn init(allocator: mem.Allocator, comptime config: Config, callback: CallbackFn, app_context: if (AppContext == void) void else *AppContext) mem.Allocator.Error!Self {
             return Self{
                 .allocator = allocator,
                 .config = config,
                 .callback = callback,
                 .app_context = app_context,
                 .middleware_list = &.{},
-                .mutex = try Mutex.init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.mutex.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -226,8 +224,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             // Publish the stop signal. If stop() was already called (before the signal existed),
             // send it now so the loop shuts down as soon as it starts running.
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(sync.io());
+                defer self.mutex.unlock(sync.io());
                 self.stop_signal = &stop_signal;
                 self.bound_port = bound_port;
                 if (self.stop_requested) {
@@ -235,11 +233,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 }
             }
             defer {
-                self.mutex.lock();
+                self.mutex.lockUncancelable(sync.io());
                 self.stop_signal = null;
                 self.bound_port = 0;
                 self.stop_requested = false;
-                self.mutex.unlock();
+                self.mutex.unlock(sync.io());
                 self.listener = null;
             }
 
@@ -250,16 +248,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         /// The port the server is listening on, or null if it is not (yet) listening. Safe to
         /// call from any thread.
         pub fn listeningPort(self: *Self) ?u16 {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(sync.io());
+            defer self.mutex.unlock(sync.io());
             return if (self.stop_signal != null) self.bound_port else null;
         }
 
         /// Asks the server to shut down. Safe to call from any thread, and before or while
         /// `start()` is running. Returns immediately; `start()` returns once shutdown is complete.
         pub fn stop(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(sync.io());
+            defer self.mutex.unlock(sync.io());
 
             self.stop_requested = true;
             if (self.stop_signal) |signal| {
@@ -284,8 +282,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const self: *Self = @ptrCast(@alignCast(handle.*.data));
 
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(sync.io());
+                defer self.mutex.unlock(sync.io());
                 // From now on stop() won't touch the handle, so it can be closed.
                 self.stop_signal = null;
             }
@@ -725,6 +723,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             };
             state.*.processing = true;
             _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
+
+            // Run the handler now rather than in the loop's next idle phase: deferring it costs a
+            // whole loop iteration per request, which under load cut throughput by about 25%.
+            // The handler may finish here, and afterProcess may free `state` (if the connection is
+            // closing), so `state` must not be touched after this; callers return right away.
+            ctx.*.lio.drain();
             return .dispatched;
         }
 
@@ -1881,4 +1885,91 @@ test "stop cancels the handlers still running" {
     server.stop();
     thread.join();
     try testing.expect(msSince(start) < 2000);
+}
+
+/// A slow backend (think database) the handlers below query over TCP. It runs on its own
+/// threads, outside the server.
+const slow_backend = struct {
+    var address: std.Io.net.IpAddress = undefined;
+
+    fn run(server: *std.Io.net.Server, connections: usize) void {
+        var threads: [16]?std.Thread = @splat(null);
+        for (threads[0..connections]) |*thread| {
+            const stream = server.accept(raw_client.io) catch break;
+            thread.* = std.Thread.spawn(.{}, serve, .{stream}) catch {
+                stream.close(raw_client.io);
+                break;
+            };
+        }
+        for (threads) |thread| if (thread) |t| t.join();
+    }
+
+    fn serve(stream: std.Io.net.Stream) void {
+        defer stream.close(raw_client.io);
+        var read_buffer: [64]u8 = undefined;
+        var reader = stream.reader(raw_client.io, &read_buffer);
+        const query = reader.interface.takeDelimiterExclusive('\n') catch return;
+        raw_client.sleep(300);
+        var write_buffer: [64]u8 = undefined;
+        var writer = stream.writer(raw_client.io, &write_buffer);
+        writer.interface.print("rows for {s}\n", .{query}) catch return;
+        writer.interface.flush() catch return;
+    }
+};
+
+test "handlers query a TCP backend concurrently through io" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const request_count = 8;
+    var backend = try (try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0)).listen(raw_client.io, .{});
+    defer backend.deinit(raw_client.io);
+    slow_backend.address = backend.socket.address;
+    const backend_thread = try std.Thread.spawn(.{}, slow_backend.run, .{ &backend, request_count });
+    defer backend_thread.join();
+
+    const handler = struct {
+        fn handler(io: std.Io, request: *GenericRequest(void), response: *Response) !void {
+            const stream = try slow_backend.address.connect(io, .{ .mode = .stream });
+            defer stream.close(io);
+            var write_buffer: [64]u8 = undefined;
+            var writer = stream.writer(io, &write_buffer);
+            try writer.interface.print("{s}\n", .{request.path});
+            try writer.interface.flush();
+            var read_buffer: [64]u8 = undefined;
+            var reader = stream.reader(io, &read_buffer);
+            const rows = try reader.interface.takeDelimiterExclusive('\n');
+            response.body = try response.arena.allocator().dupe(u8, rows);
+        }
+    }.handler;
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    const start = std.Io.Clock.Timestamp.now(raw_client.io, .awake);
+    var streams: [request_count]std.Io.net.Stream = undefined;
+    for (&streams, 0..) |*stream, i| {
+        stream.* = try raw_client.connect(port);
+        var request_buffer: [128]u8 = undefined;
+        try raw_client.send(stream.*, try std.fmt.bufPrint(&request_buffer, "GET /{d} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{i}));
+    }
+    defer for (streams) |stream| stream.close(raw_client.io);
+
+    for (streams, 0..) |stream, i| {
+        const received = try raw_client.receiveAll(stream, allocator);
+        defer allocator.free(received);
+        var body_buffer: [32]u8 = undefined;
+        const expected = try raw_client.okResponse(allocator, try std.fmt.bufPrint(&body_buffer, "rows for /{d}", .{i}));
+        defer allocator.free(expected);
+        try testing.expectEqualStrings(expected, received);
+    }
+    // The eight 300 ms queries overlap.
+    try testing.expect(msSince(start) < 1500);
 }

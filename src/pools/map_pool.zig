@@ -1,5 +1,5 @@
 const std = @import("std");
-const Mutex = @import("mutex.zig").Mutex;
+const sync = @import("sync.zig");
 
 pub const Options = struct {
     growable: bool = true,
@@ -8,7 +8,7 @@ pub const Options = struct {
     max_retained_capacity: u32 = 64,
 };
 
-pub const MemoryPoolError = Mutex.InitError;
+pub const MemoryPoolError = std.mem.Allocator.Error;
 
 /// A thread-safe pool of `StringHashMap([]const u8)`.
 ///
@@ -28,7 +28,7 @@ pub fn MapPool(comptime options: Options) type {
         /// Every map ever allocated by the pool, so that `deinit` can free maps
         /// that are still in use.
         all_list: ?*Entry = null,
-        mutex: Mutex,
+        mutex: std.Io.Mutex = .init,
 
         const Self = @This();
 
@@ -39,7 +39,7 @@ pub fn MapPool(comptime options: Options) type {
         };
 
         pub fn init(allocator: std.mem.Allocator) MemoryPoolError!Self {
-            return .{ .allocator = allocator, .mutex = try Mutex.init(allocator) };
+            return .{ .allocator = allocator };
         }
 
         pub fn initPreheated(allocator: std.mem.Allocator, initial_size: usize) MemoryPoolError!Self {
@@ -50,8 +50,8 @@ pub fn MapPool(comptime options: Options) type {
         }
 
         pub fn preheat(self: *Self, size: usize) MemoryPoolError!void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(sync.io());
+            defer self.mutex.unlock(sync.io());
 
             for (0..size) |_| {
                 const entry = try self.allocEntry();
@@ -77,8 +77,8 @@ pub fn MapPool(comptime options: Options) type {
         }
 
         pub fn create(self: *Self) MemoryPoolError!*MapType {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(sync.io());
+            defer self.mutex.unlock(sync.io());
 
             if (self.free_list) |entry| {
                 self.free_list = entry.next_free;
@@ -105,8 +105,8 @@ pub fn MapPool(comptime options: Options) type {
 
             const entry: *Entry = @fieldParentPtr("map", map_ptr);
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(sync.io());
+            defer self.mutex.unlock(sync.io());
 
             entry.next_free = self.free_list;
             self.free_list = entry;
@@ -119,7 +119,6 @@ pub fn MapPool(comptime options: Options) type {
                 entry.map.deinit();
                 self.allocator.destroy(entry);
             }
-            self.mutex.deinit(self.allocator);
             self.* = undefined;
         }
     };

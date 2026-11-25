@@ -81,9 +81,18 @@ fn getUser(io: std.Io, request: *azig.Request, response: *azig.Response) !void {
 Each request's handler runs as a task with its own stack (a fiber) on the server's event loop.
 When it waits through `io`, its task is suspended and the loop serves other requests, so slow
 handlers don't stall the server, and thousands of waiting handlers cost memory rather than
-threads. Tasks, groups, cancelation, sleeping and `Io.Mutex` / `Io.Condition` / `Io.Queue` are
-handled on the loop itself; files, sockets, DNS and other blocking operations are performed by
-worker threads (an internal `std.Io.Threaded`) while the task waits.
+threads. Under the hood, `io` is built on libuv:
+
+| Operations                                                               | Performed                                                    |
+|--------------------------------------------------------------------------|--------------------------------------------------------------|
+| Tasks, groups, cancelation, sleeping, `Io.Mutex` / `Condition` / `Queue` | On the event loop                                            |
+| TCP sockets (listen, accept, connect, read, write)                       | On the event loop, with libuv's TCP handles: no thread waits |
+| DNS lookups (`HostName.lookup`, `HostName.connect`)                      | libuv's `uv_getaddrinfo`                                     |
+| Files and directories                                                    | libuv's thread pool                                          |
+| Everything else (UDP, Unix sockets, child processes, pipes)              | Worker threads of an internal `std.Io.Threaded`              |
+
+libuv's thread pool, shared by file operations and DNS lookups, has 4 threads by default; set
+the `UV_THREADPOOL_SIZE` environment variable (up to 1024) before starting the server to change it.
 
 You must:
 
@@ -94,8 +103,9 @@ You must:
 * **Use `io` only inside handlers**, not from other threads.
 * **Timeouts cancel the handler.** If a handler runs longer than `timeout`, the client gets a
   `408` and the handler is canceled: its next (or current) `io` call returns `error.Canceled`.
-  The same happens when the client disconnects or the server stops. Operations performed by the
-  worker threads are not interrupted; the cancelation takes effect once they return. Use
+  The same happens when the client disconnects or the server stops. Waits, sleeps, TCP reads,
+  accepts and connects are interrupted right away; TCP writes, and file or other operations already
+  running on a thread, are not: the cancelation takes effect once they return. Use
   `io.swapCancelProtection` to protect code that must not be interrupted.
 
 ## Configuration

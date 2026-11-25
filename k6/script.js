@@ -13,5 +13,4 @@ const fiftyKbObject = {
 export default function() {
   let res = http.post('http://0.0.0.0:2500');
   check(res, { "status is 200": (res) => res.status === 200 });
-  sleep(1);
 }

@@ -5,17 +5,34 @@
 //! `Io.Condition`, `Io.Queue`, ...), it switches back to the loop instead of blocking the
 //! thread, so thousands of waiting tasks cost memory, not threads.
 //!
-//! Tasks, groups, cancelation, futexes and sleeping are implemented natively. Every other
-//! operation (files, sockets, DNS, processes, ...) is handed to an `Io.Threaded` instance: the
-//! task is suspended while one of that instance's worker threads performs the blocking call,
-//! and it resumes on the loop once the call returns. The loop thread itself never blocks.
+//! How each kind of operation is performed:
+//! - Tasks, groups, cancelation, futexes, sleeping: on the loop.
+//! - TCP sockets (listen, accept, connect, read, write, close): on the loop, with `uv_tcp_t`.
+//!   Waiting for a connection or for data costs no thread.
+//! - DNS (`HostName.lookup`, and so `HostName.connect`): `uv_getaddrinfo`.
+//! - Files and directories: on libuv's thread pool, like libuv's own `uv_fs_*` (which cannot
+//!   be used directly: it takes C runtime descriptors on Windows, where std uses OS handles,
+//!   and has no directory-relative operations). The operation itself is std's
+//!   (`Io.Threaded`'s), so its behavior and errors are exactly std's.
+//! - Everything else (UDP and Unix domain sockets, child processes, reading pipes and
+//!   terminals, ...): on `Io.Threaded`'s pool, which grows as needed, so operations that may
+//!   block indefinitely cannot use up libuv's small pool. Quick operations (clocks, random
+//!   numbers, closing files) run directly.
+//! In every case the task is suspended until the operation completes; the loop thread never
+//! blocks.
 //!
 //! Rules:
 //! - The `Io` must only be used from the tasks it runs (all of them run on the loop thread).
 //! - Code that blocks the thread without going through the `Io` (a C library calling `recv`,
 //!   `std.Thread.sleep`, a long CPU-bound loop) blocks the whole loop.
-//! - Operations handed to `Io.Threaded` are not interrupted by cancelation: a cancel request
-//!   takes effect at the task's next cancelation point after the operation returns.
+//! - Operations on a thread pool are not interrupted by cancelation once they have started
+//!   (one still queued on libuv's pool is removed from the queue): a cancel request then
+//!   takes effect at the task's next cancelation point. TCP reads, accepts and connects, DNS
+//!   lookups that have not started, sleeps and waits are interrupted right away. TCP writes
+//!   are not: libuv uses the caller's buffers until the write completes.
+//! - libuv's thread pool has 4 threads unless the `UV_THREADPOOL_SIZE` environment variable
+//!   says otherwise (read when the pool first starts; at most 1024). File operations and DNS
+//!   lookups share it.
 //!
 //! Fibers use std's context switch (`std.Io.fiber`) on POSIX systems, and Win32 fibers on
 //! Windows, where switching stacks also needs the thread information block to be updated.
@@ -24,6 +41,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const uv = @import("uv");
 const Io = std.Io;
+const net = Io.net;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
@@ -87,7 +105,9 @@ pub const Libuv = struct {
 
     idle_fibers: ?*Fiber = null,
     idle_count: usize = 0,
-    futex_buckets: [futex_bucket_count]?*Fiber = @splat(null),
+    futex_buckets: [futex_bucket_count]WaitList = @splat(.{}),
+    /// TCP sockets managed by libuv, by OS handle.
+    sockets: std.AutoHashMapUnmanaged(usize, *TcpSocket) = .empty,
 
     const MainContext = if (is_windows) *anyopaque else Io.fiber.Context;
 
@@ -136,6 +156,14 @@ pub const Libuv = struct {
 
         uv.uv_close(@ptrCast(&lio.idle), null);
         uv.uv_close(@ptrCast(&lio.wake_signal), null);
+
+        // Sockets the application left open.
+        var sockets = lio.sockets.valueIterator();
+        while (sockets.next()) |s| {
+            s.*.closing = true;
+            uv.uv_close(@ptrCast(&s.*.tcp), TcpSocket.onClosed);
+        }
+        lio.sockets.deinit(lio.allocator);
 
         while (lio.idle_fibers) |fiber| {
             lio.idle_fibers = fiber.next;
@@ -249,7 +277,11 @@ pub const Libuv = struct {
     }
 
     /// Runs ready fibers until none is left. Only runs on the loop's own context.
-    fn drain(lio: *Libuv) void {
+    ///
+    /// Tasks started from a libuv callback otherwise only run once the loop reaches its idle
+    /// phase, in the next iteration. Callers that start a task on a hot path (one per
+    /// request) call this right away so the task runs now instead.
+    pub fn drain(lio: *Libuv) void {
         if (lio.draining) return;
         assert(lio.current == null);
         lio.draining = true;
@@ -328,7 +360,7 @@ pub const Libuv = struct {
 
     fn wake(lio: *Libuv, fiber: *Fiber, reason: Fiber.Woke) void {
         if (fiber.state != .waiting) return;
-        if (fiber.wait == .futex) lio.futexRemove(fiber);
+        if (fiber.wait_list) |list| list.remove(fiber);
         if (fiber.timer_active) {
             _ = uv.uv_timer_stop(&fiber.timer);
             fiber.timer_active = false;
@@ -442,25 +474,8 @@ pub const Libuv = struct {
     // ---------------------------------------------------------------------------------------
     // Futex
 
-    fn futexBucket(lio: *Libuv, address: usize) *?*Fiber {
+    fn futexBucket(lio: *Libuv, address: usize) *WaitList {
         return &lio.futex_buckets[(address >> 2) % futex_bucket_count];
-    }
-
-    fn futexInsert(lio: *Libuv, fiber: *Fiber, address: usize) void {
-        const bucket = lio.futexBucket(address);
-        fiber.futex_address = address;
-        fiber.wait_prev = null;
-        fiber.wait_next = bucket.*;
-        if (bucket.*) |head| head.wait_prev = fiber;
-        bucket.* = fiber;
-    }
-
-    fn futexRemove(lio: *Libuv, fiber: *Fiber) void {
-        const bucket = lio.futexBucket(fiber.futex_address);
-        if (fiber.wait_prev) |prev| prev.wait_next = fiber.wait_next else bucket.* = fiber.wait_next;
-        if (fiber.wait_next) |next| next.wait_prev = fiber.wait_prev;
-        fiber.wait_prev = null;
-        fiber.wait_next = null;
     }
 
     fn futexWaitInner(lio: *Libuv, ptr: *const u32, expected: u32, timeout: Io.Timeout, cancelable: bool) Io.Cancelable!void {
@@ -473,12 +488,223 @@ pub const Libuv = struct {
             if (d.raw.toNanoseconds() <= 0) return;
         }
 
-        lio.futexInsert(fiber, @intFromPtr(ptr));
+        fiber.futex_address = @intFromPtr(ptr);
+        lio.futexBucket(fiber.futex_address).insert(fiber);
         if (duration) |d| startTimer(fiber, d.raw);
         switch (lio.suspendCurrent(.futex, cancelable)) {
-            .normal, .timeout => {},
+            .normal, .timeout, .closed => {},
             .canceled => return error.Canceled,
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // TCP sockets, on `uv_tcp_t`. std refers to sockets by their OS handle; `sockets` maps the
+    // handles of the sockets created here to their libuv handle. Sockets that are not in the
+    // map (UDP, Unix domain sockets) are left to the fallback.
+
+    fn findSocket(lio: *Libuv, handle: net.Socket.Handle) ?*TcpSocket {
+        return lio.sockets.get(socketKey(handle));
+    }
+
+    /// Returns null (with the libuv error in `status`) if the socket cannot be created.
+    /// `family` is `AF_UNSPEC` for a socket that will be filled in by `uv_accept`.
+    fn tcpCreate(lio: *Libuv, family: c_int, status: *c_int) ?*TcpSocket {
+        const s = lio.allocator.create(TcpSocket) catch {
+            status.* = uv.UV_ENOMEM;
+            return null;
+        };
+        s.* = .{ .lio = lio, .allocator = lio.allocator };
+        const r = uv.uv_tcp_init_ex(lio.loop, &s.tcp, @intCast(family));
+        if (r != 0) {
+            lio.allocator.destroy(s);
+            status.* = r;
+            return null;
+        }
+        s.tcp.data = s;
+        return s;
+    }
+
+    /// Makes the socket known by its OS handle. Returns a libuv error code.
+    fn tcpRegister(lio: *Libuv, s: *TcpSocket) c_int {
+        var fd: uv.uv_os_fd_t = undefined;
+        const r = uv.uv_fileno(@ptrCast(&s.tcp), &fd);
+        if (r != 0) return r;
+        s.os_handle = socketHandleFromUv(fd);
+        lio.sockets.put(lio.allocator, socketKey(s.os_handle), s) catch return uv.UV_ENOMEM;
+        s.registered = true;
+        return 0;
+    }
+
+    /// Closes the socket. Fibers waiting on it wake up with `closed`; its memory is freed once
+    /// libuv has finished closing it.
+    fn tcpClose(lio: *Libuv, s: *TcpSocket) void {
+        if (s.closing) return;
+        s.closing = true;
+        if (s.registered) _ = lio.sockets.remove(socketKey(s.os_handle));
+        if (s.read_op) |op| {
+            s.read_op = null;
+            lio.wake(op.fiber, .closed);
+        }
+        while (s.accept_waiters.head) |fiber| lio.wake(fiber, .closed);
+        uv.uv_close(@ptrCast(&s.tcp), TcpSocket.onClosed);
+    }
+
+    fn tcpRead(lio: *Libuv, s: *TcpSocket, o: Io.Operation.NetRead) Io.Cancelable!Io.Operation.NetRead.Result {
+        const Result = Io.Operation.NetRead.Result;
+        const fiber = lio.currentFiber();
+        try fiber.checkCancel();
+        const buffer = for (o.data) |b| {
+            if (b.len > 0) break b;
+        } else return .{ .data_len = 0 };
+        assert(s.read_op == null); // one read at a time per socket
+
+        // libuv asks for a buffer (onAlloc) only once data has arrived, on every platform, so
+        // the caller's buffer is never used after the read is stopped.
+        var op: TcpSocket.ReadOp = .{ .fiber = fiber, .buffer = buffer };
+        s.read_op = &op;
+        const r = uv.uv_read_start(s.stream(), TcpSocket.onAlloc, TcpSocket.onRead);
+        if (r != 0) {
+            s.read_op = null;
+            return @as(Result, uvError(Io.Operation.NetRead.Error, r));
+        }
+        while (op.result == null) {
+            switch (lio.suspendCurrent(.socket, true)) {
+                .normal, .timeout => {},
+                // The socket is gone: do not touch it.
+                .closed => return @as(Result, error.SocketUnconnected),
+                .canceled => {
+                    if (op.result != null) {
+                        fiber.cancel = .requested; // data arrived as well: report that first
+                        break;
+                    }
+                    _ = uv.uv_read_stop(s.stream());
+                    s.read_op = null;
+                    return error.Canceled;
+                },
+            }
+        }
+        const n = op.result.?;
+        if (n >= 0) return .{ .data_len = @intCast(n) };
+        if (n == uv.UV_EOF) return .{ .data_len = 0 };
+        return @as(Result, uvError(Io.Operation.NetRead.Error, @intCast(n)));
+    }
+
+    fn tcpWrite(lio: *Libuv, s: *TcpSocket, o: Io.Operation.NetWrite) Io.Cancelable!Io.Operation.NetWrite.Result {
+        const Result = Io.Operation.NetWrite.Result;
+        var bufs: [max_write_buffers]uv.uv_buf_t = undefined;
+        var count: usize = 0;
+        var total: usize = 0;
+        const Add = struct {
+            fn add(b: *[max_write_buffers]uv.uv_buf_t, c: *usize, t: *usize, bytes: []const u8) void {
+                if (bytes.len == 0 or c.* == b.len) return;
+                const len: c_uint = @intCast(@min(bytes.len, std.math.maxInt(c_uint)));
+                b[c.*] = uv.uv_buf_init(@constCast(bytes.ptr), len);
+                c.* += 1;
+                t.* += len;
+            }
+        };
+        Add.add(&bufs, &count, &total, o.header);
+        if (o.data.len > 0) {
+            for (o.data[0 .. o.data.len - 1]) |bytes| Add.add(&bufs, &count, &total, bytes);
+            const last = o.data[o.data.len - 1];
+            // Writing fewer bytes than asked is allowed: the caller writes the rest later.
+            if (last.len > 0) for (0..o.splat) |_| {
+                if (count == bufs.len) break;
+                Add.add(&bufs, &count, &total, last);
+            };
+        }
+        if (total == 0) return 0;
+
+        // Most writes complete right away, without suspending.
+        const tried = uv.uv_try_write(s.stream(), &bufs, @intCast(count));
+        if (tried > 0) return @as(usize, @intCast(tried));
+        if (tried < 0 and tried != uv.UV_EAGAIN and tried != uv.UV_ENOSYS) {
+            return @as(Result, uvError(Io.Operation.NetWrite.Error, tried));
+        }
+
+        const fiber = lio.currentFiber();
+        var op: TcpSocket.WriteOp = .{ .fiber = fiber };
+        op.req.data = &op;
+        const r = uv.uv_write(&op.req, s.stream(), &bufs, @intCast(count), TcpSocket.onWrite);
+        if (r != 0) return @as(Result, uvError(Io.Operation.NetWrite.Error, r));
+        // A write cannot be aborted (libuv uses the buffers until it completes), so this wait is
+        // not a cancelation point. Closing the socket completes it with an error.
+        while (op.status == null) _ = lio.suspendCurrent(.socket, false);
+        if (op.status.? != 0) return @as(Result, uvError(Io.Operation.NetWrite.Error, op.status.?));
+        return total;
+    }
+
+    fn lookup(
+        lio: *Libuv,
+        fiber: *Fiber,
+        host_name: net.HostName,
+        resolved: *Io.Queue(net.HostName.LookupResult),
+        options: net.HostName.LookupOptions,
+    ) (net.HostName.LookupError || Io.QueueClosedError)!void {
+        try fiber.checkCancel();
+        const io_ = lio.io();
+        const name = host_name.bytes;
+        assert(name.len <= net.HostName.max_len);
+
+        var name_buffer: [net.HostName.max_len:0]u8 = undefined;
+        @memcpy(name_buffer[0..name.len], name);
+        name_buffer[name.len] = 0;
+        var port_buffer: [8]u8 = undefined;
+        const port = std.mem.printSentinel(&port_buffer, "{d}", .{options.port}, 0) catch unreachable;
+
+        var hints: uv.struct_addrinfo = .{};
+        hints.ai_flags = uv.AI_NUMERICSERV | @as(c_int, if (options.canonical_name_buffer != null) uv.AI_CANONNAME else 0);
+        hints.ai_family = if (options.family) |family| switch (family) {
+            .ip4 => uv.AF_INET,
+            .ip6 => uv.AF_INET6,
+        } else uv.AF_UNSPEC;
+        hints.ai_socktype = uv.SOCK_STREAM;
+        hints.ai_protocol = uv.IPPROTO_TCP;
+
+        var op: LookupOp = .{ .fiber = fiber };
+        op.req.data = &op;
+        const r = uv.uv_getaddrinfo(lio.loop, &op.req, LookupOp.onResolved, &name_buffer, port.ptr, &hints);
+        if (r != 0) return lookupError(r);
+
+        // getaddrinfo runs on libuv's thread pool: a lookup that has not started yet can be
+        // canceled; one in progress runs to completion.
+        var cancel_tried = false;
+        while (op.status == null) {
+            if (lio.suspendCurrent(.dns, !cancel_tried) == .canceled) {
+                cancel_tried = true;
+                if (uv.uv_cancel(@ptrCast(&op.req)) != 0) fiber.cancel = .requested;
+            }
+        }
+        if (op.status.? == uv.UV_ECANCELED) return error.Canceled;
+        if (op.status.? != 0) return lookupError(op.status.?);
+        defer uv.uv_freeaddrinfo(op.res);
+
+        var canonical_name: ?[*:0]const u8 = null;
+        var it: [*c]uv.struct_addrinfo = op.res;
+        while (it != null) : (it = it.*.ai_next) {
+            const info = it.*;
+            if (info.ai_addr == null) continue;
+            try resolved.putOne(io_, .{ .address = Io.Threaded.addressFromPosix(@ptrCast(@alignCast(info.ai_addr))) });
+            if (canonical_name == null and info.ai_canonname != null) canonical_name = info.ai_canonname;
+        }
+        if (canonical_name) |canon| {
+            if (options.canonical_name_buffer) |buffer| {
+                const bytes = std.mem.sliceTo(canon, 0);
+                const len = @min(bytes.len, buffer.len);
+                @memcpy(buffer[0..len], bytes[0..len]);
+                try resolved.putOne(io_, .{ .canonical_name = .{ .bytes = buffer[0..len] } });
+            }
+        }
+    }
+
+    fn lookupError(code: c_int) net.HostName.LookupError {
+        return switch (code) {
+            uv.UV_EAI_NONAME, uv.UV_EAI_NODATA => error.UnknownHostName,
+            uv.UV_EAI_AGAIN, uv.UV_EAI_FAIL => error.NameServerFailure,
+            uv.UV_EAI_FAMILY, uv.UV_EAI_ADDRFAMILY => error.AddressFamilyUnsupported,
+            uv.UV_EAI_MEMORY, uv.UV_ENOMEM => error.SystemResources,
+            else => error.Unexpected,
+        };
     }
 
     // ---------------------------------------------------------------------------------------
@@ -654,7 +880,7 @@ pub const Libuv = struct {
             lio.assertLoopThread();
             const address = @intFromPtr(ptr);
             var woken: u32 = 0;
-            var node = lio.futexBucket(address).*;
+            var node = lio.futexBucket(address).head;
             while (node) |fiber| {
                 if (woken == max_waiters) break;
                 node = fiber.wait_next;
@@ -678,9 +904,189 @@ pub const Libuv = struct {
                 startTimer(fiber, d.raw);
             }
             switch (lio.suspendCurrent(.sleep, true)) {
-                .normal, .timeout => {},
+                .normal, .timeout, .closed => {},
                 .canceled => return error.Canceled,
             }
+        }
+
+        pub fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            switch (operation) {
+                .net_read => |o| if (lio.findSocket(o.socket_handle)) |s| return .{ .net_read = try lio.tcpRead(s, o) },
+                .net_write => |o| if (lio.findSocket(o.socket_handle)) |s| return .{ .net_write = try lio.tcpWrite(s, o) },
+                else => {},
+            }
+            return Forward("operate").call(userdata, .{operation});
+        }
+
+        pub fn netListenIp(
+            userdata: ?*anyopaque,
+            address: *const net.IpAddress,
+            options: net.IpAddress.ListenOptions,
+        ) net.IpAddress.ListenError!net.Socket {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            if (options.mode != .stream or options.protocol != .tcp) {
+                return Forward("netListenIp").call(userdata, .{ address, options });
+            }
+            lio.assertLoopThread();
+            if (lio.current) |fiber| try fiber.checkCancel();
+
+            var status: c_int = 0;
+            const s = lio.tcpCreate(addressFamily(address), &status) orelse
+                return uvError(net.IpAddress.ListenError, status);
+            var storage: Io.Threaded.PosixAddress = undefined;
+            // libuv always sets SO_REUSEADDR on POSIX systems; SO_REUSEPORT needs a flag.
+            const flags: c_uint = if (options.reuse_address and builtin.os.tag == .linux) uv.UV_TCP_REUSEPORT else 0;
+            var r = uv.uv_tcp_bind(&s.tcp, uvAddress(address, &storage), flags);
+            if (r == 0) r = uv.uv_listen(s.stream(), @intCast(options.kernel_backlog), TcpSocket.onConnection);
+            if (r == 0) r = lio.tcpRegister(s);
+            if (r != 0) {
+                lio.tcpClose(s);
+                return uvError(net.IpAddress.ListenError, r);
+            }
+            return .{ .handle = s.os_handle, .address = s.localAddress() };
+        }
+
+        pub fn netAccept(
+            userdata: ?*anyopaque,
+            server: net.Socket.Handle,
+            options: net.Server.AcceptOptions,
+        ) net.Server.AcceptError!net.Socket {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            const s = lio.findSocket(server) orelse return Forward("netAccept").call(userdata, .{ server, options });
+            const fiber = lio.currentFiber();
+            try fiber.checkCancel();
+
+            while (true) {
+                if (s.pending > 0) {
+                    var status: c_int = 0;
+                    const client = lio.tcpCreate(uv.AF_UNSPEC, &status) orelse
+                        return uvError(net.Server.AcceptError, status);
+                    const r = uv.uv_accept(s.stream(), client.stream());
+                    if (r == uv.UV_EAGAIN) {
+                        // The reported connection is gone (or was already taken).
+                        s.pending = 0;
+                        lio.tcpClose(client);
+                        continue;
+                    }
+                    s.pending -= 1;
+                    const registered = if (r == 0) lio.tcpRegister(client) else r;
+                    if (registered != 0) {
+                        lio.tcpClose(client);
+                        return uvError(net.Server.AcceptError, registered);
+                    }
+                    return .{ .handle = client.os_handle, .address = client.peerAddress() };
+                }
+                if (s.listen_status != 0) {
+                    const status = s.listen_status;
+                    s.listen_status = 0;
+                    return uvError(net.Server.AcceptError, status);
+                }
+                s.accept_waiters.insert(fiber);
+                switch (lio.suspendCurrent(.socket, true)) {
+                    .normal, .timeout => {},
+                    .canceled => return error.Canceled,
+                    // The listening socket was closed: do not touch it.
+                    .closed => return error.SocketNotListening,
+                }
+            }
+        }
+
+        pub fn netConnectIp(
+            userdata: ?*anyopaque,
+            address: *const net.IpAddress,
+            options: net.IpAddress.ConnectOptions,
+        ) net.IpAddress.ConnectError!net.Socket {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            if (options.mode != .stream or (options.protocol orelse .tcp) != .tcp) {
+                return Forward("netConnectIp").call(userdata, .{ address, options });
+            }
+            const fiber = lio.currentFiber();
+            try fiber.checkCancel();
+
+            var status: c_int = 0;
+            const s = lio.tcpCreate(addressFamily(address), &status) orelse
+                return uvError(net.IpAddress.ConnectError, status);
+            var storage: Io.Threaded.PosixAddress = undefined;
+            var op: TcpSocket.ConnectOp = .{ .fiber = fiber };
+            op.req.data = &op;
+            const r = uv.uv_tcp_connect(&op.req, &s.tcp, uvAddress(address, &storage), TcpSocket.onConnect);
+            if (r != 0) {
+                lio.tcpClose(s);
+                return uvError(net.IpAddress.ConnectError, r);
+            }
+            if (options.timeout.toDurationFromNow(lio.io())) |d| startTimer(fiber, d.raw);
+
+            // Canceling or timing out closes the socket; libuv then completes the request with
+            // UV_ECANCELED. Until then `op` must stay alive, and afterwards `s` is gone.
+            var interrupted: ?enum { canceled, timeout } = null;
+            var closed = false;
+            while (op.status == null) {
+                switch (lio.suspendCurrent(.socket, interrupted == null)) {
+                    .normal, .closed => continue,
+                    .canceled => interrupted = .canceled,
+                    .timeout => interrupted = .timeout,
+                }
+                if (op.status == null and !closed) {
+                    lio.tcpClose(s);
+                    closed = true;
+                }
+            }
+            if (closed) {
+                return switch (interrupted orelse .canceled) {
+                    .canceled => error.Canceled,
+                    .timeout => error.Timeout,
+                };
+            }
+            // Connected (or failed) before the interruption could take effect.
+            if (interrupted == .canceled) fiber.cancel = .requested;
+
+            const registered = if (op.status.? == 0) lio.tcpRegister(s) else op.status.?;
+            if (registered != 0) {
+                lio.tcpClose(s);
+                return uvError(net.IpAddress.ConnectError, registered);
+            }
+            return .{ .handle = s.os_handle, .address = address.* };
+        }
+
+        pub fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            for (sockets) |*socket| {
+                if (lio.findSocket(socket.handle)) |s| {
+                    lio.tcpClose(s);
+                } else {
+                    Forward("netClose").call(userdata, .{socket[0..1]});
+                }
+            }
+        }
+
+        pub fn netWriteFile(
+            userdata: ?*anyopaque,
+            handle: net.Socket.Handle,
+            header: []const u8,
+            file_reader: *Io.File.Reader,
+            limit: Io.Limit,
+        ) net.Stream.Writer.WriteFileError!usize {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            // No zero-copy path for libuv sockets: the writer falls back to reading the file and
+            // writing what it read.
+            if (lio.findSocket(handle) != null) return error.Unimplemented;
+            return Forward("netWriteFile").call(userdata, .{ handle, header, file_reader, limit });
+        }
+
+        pub fn netLookup(
+            userdata: ?*anyopaque,
+            host_name: net.HostName,
+            resolved: *Io.Queue(net.HostName.LookupResult),
+            options: net.HostName.LookupOptions,
+        ) net.HostName.LookupError!void {
+            const lio: *Libuv = @ptrCast(@alignCast(userdata));
+            const fiber = lio.current orelse return Forward("netLookup").call(userdata, .{ host_name, resolved, options });
+            defer resolved.close(lio.io());
+            lio.lookup(fiber, host_name, resolved, options) catch |err| switch (err) {
+                error.Closed => unreachable, // `resolved` must not be closed until `netLookup` returns
+                else => |e| return e,
+            };
         }
     };
 
@@ -695,7 +1101,7 @@ pub const Libuv = struct {
         "processCurrentPath",      "processSetCurrentDir", "processSetCurrentPath",
         "processReplace",          "progressParentFile",   "inheritParentDir",
         "inheritParentFile",       "fileClose",            "dirClose",
-        "netClose",                "childKill",            "fileMemoryMapDestroy",
+        "netClose",                "netShutdown",          "childKill",            "fileMemoryMapDestroy",
         "netInterfaceName",        "netInterfaceNameResolve",
         "fileIsTty",               "fileSupportsAnsiEscapeCodes",
         "fileEnableAnsiEscapeCodes",
@@ -706,6 +1112,23 @@ pub const Libuv = struct {
             if (std.mem.eql(u8, inline_name, name)) return true;
         }
         return false;
+    }
+
+    const Backend = enum {
+        /// Called directly: the operation never blocks for long.
+        run_inline,
+        /// File system operations, on libuv's thread pool (like libuv's own `uv_fs_*`).
+        uv_pool,
+        /// Operations that may block indefinitely (waiting for a child process, sockets that
+        /// libuv does not manage, reading a pipe or terminal), on `Io.Threaded`'s pool, which
+        /// grows as needed, so they cannot use up libuv's small pool.
+        threaded,
+    };
+
+    fn backendOf(comptime name: []const u8) Backend {
+        if (runsInline(name)) return .run_inline;
+        if (std.mem.startsWith(u8, name, "dir") or std.mem.startsWith(u8, name, "file")) return .uv_pool;
+        return .threaded;
     }
 
     fn canReturnCanceled(comptime R: type) bool {
@@ -727,19 +1150,22 @@ pub const Libuv = struct {
         const info = @typeInfo(Fn).@"fn";
         const R = info.return_type.?;
         const P = info.param_types;
-        const offload = !runsInline(name);
+        const backend = backendOf(name);
+        const cancelable = canReturnCanceled(R);
 
         return struct {
             fn call(userdata: ?*anyopaque, args: anytype) R {
                 const lio: *Libuv = @ptrCast(@alignCast(userdata));
                 const fallback = lio.fallback.io();
                 const target = @field(fallback.vtable, name);
-                if (!offload) return @call(.auto, target, .{fallback.userdata} ++ args);
+                if (backend == .run_inline) return @call(.auto, target, .{fallback.userdata} ++ args);
 
                 const fiber = lio.current orelse return @call(.auto, target, .{fallback.userdata} ++ args);
-                if (comptime canReturnCanceled(R)) {
+                if (cancelable) {
                     fiber.checkCancel() catch return error.Canceled;
                 }
+
+                if (backend == .uv_pool) return callOnUvPool(lio, fiber, args);
 
                 const Job = struct {
                     lio: *Libuv,
@@ -764,6 +1190,50 @@ pub const Libuv = struct {
                     return @call(.auto, target, .{fallback.userdata} ++ args);
                 };
                 _ = lio.suspendCurrent(.offload, false);
+                return job.result;
+            }
+
+            /// Performs the operation on libuv's thread pool. While it is still queued, a
+            /// cancel request removes it from the queue.
+            fn callOnUvPool(lio: *Libuv, fiber: *Fiber, args: anytype) R {
+                const Job = struct {
+                    req: uv.uv_work_t = undefined,
+                    lio: *Libuv,
+                    fiber: *Fiber,
+                    args: @TypeOf(args),
+                    result: R = undefined,
+                    status: ?c_int = null,
+
+                    fn work(req: [*c]uv.uv_work_t) callconv(.c) void {
+                        const job: *@This() = @alignCast(@fieldParentPtr("req", @as(*uv.uv_work_t, req)));
+                        const fb = job.lio.fallback.io();
+                        job.result = @call(.auto, @field(fb.vtable, name), .{fb.userdata} ++ job.args);
+                    }
+
+                    fn after(req: [*c]uv.uv_work_t, status: c_int) callconv(.c) void {
+                        const job: *@This() = @alignCast(@fieldParentPtr("req", @as(*uv.uv_work_t, req)));
+                        job.status = status;
+                        job.lio.wake(job.fiber, .normal);
+                        job.lio.drain();
+                    }
+                };
+                var job: Job = .{ .lio = lio, .fiber = fiber, .args = args };
+                if (uv.uv_queue_work(lio.loop, &job.req, Job.work, Job.after) != 0) {
+                    const fallback = lio.fallback.io();
+                    return @call(.auto, @field(fallback.vtable, name), .{fallback.userdata} ++ args);
+                }
+
+                var cancel_tried = false;
+                while (job.status == null) {
+                    if (lio.suspendCurrent(.offload, cancelable and !cancel_tried) == .canceled) {
+                        cancel_tried = true;
+                        // Succeeds only if no thread has picked the operation up yet. Otherwise it
+                        // runs to completion and the request stays pending for the next
+                        // cancelation point.
+                        if (uv.uv_cancel(@ptrCast(&job.req)) != 0) fiber.cancel = .requested;
+                    }
+                }
+                if (cancelable and job.status.? == uv.UV_ECANCELED) return error.Canceled;
                 return job.result;
             }
 
@@ -821,6 +1291,200 @@ pub const Libuv = struct {
     };
 };
 
+/// Most buffers passed to one `uv_write`; a larger write is done in parts.
+const max_write_buffers = 32;
+
+/// A TCP socket managed by libuv (see `Libuv.findSocket`).
+const TcpSocket = struct {
+    lio: *Libuv,
+    allocator: Allocator,
+    tcp: uv.uv_tcp_t = undefined,
+    os_handle: net.Socket.Handle = undefined,
+    /// Whether `os_handle` is in `Libuv.sockets`.
+    registered: bool = false,
+    closing: bool = false,
+
+    /// Listening sockets: connections libuv reported that have not been accepted yet.
+    pending: u32 = 0,
+    /// Listening sockets: an error libuv reported instead of a connection.
+    listen_status: c_int = 0,
+    accept_waiters: WaitList = .{},
+
+    /// The read in progress, if any. Lives on the reading fiber's stack.
+    read_op: ?*ReadOp = null,
+
+    const ReadOp = struct { fiber: *Fiber, buffer: []u8, result: ?isize = null };
+    const WriteOp = struct { req: uv.uv_write_t = undefined, fiber: *Fiber, status: ?c_int = null };
+    const ConnectOp = struct { req: uv.uv_connect_t = undefined, fiber: *Fiber, status: ?c_int = null };
+
+    fn stream(s: *TcpSocket) *uv.uv_stream_t {
+        return @ptrCast(&s.tcp);
+    }
+
+    fn localAddress(s: *TcpSocket) net.IpAddress {
+        var storage: uv.struct_sockaddr_storage = undefined;
+        var len: c_int = @sizeOf(uv.struct_sockaddr_storage);
+        if (uv.uv_tcp_getsockname(&s.tcp, @ptrCast(&storage), &len) != 0) return .{ .ip4 = .loopback(0) };
+        return Io.Threaded.addressFromPosix(@ptrCast(@alignCast(&storage)));
+    }
+
+    fn peerAddress(s: *TcpSocket) net.IpAddress {
+        var storage: uv.struct_sockaddr_storage = undefined;
+        var len: c_int = @sizeOf(uv.struct_sockaddr_storage);
+        if (uv.uv_tcp_getpeername(&s.tcp, @ptrCast(&storage), &len) != 0) return .{ .ip4 = .loopback(0) };
+        return Io.Threaded.addressFromPosix(@ptrCast(@alignCast(&storage)));
+    }
+
+    fn onClosed(handle: [*c]uv.uv_handle_t) callconv(.c) void {
+        const s: *TcpSocket = @ptrCast(@alignCast(handle.*.data));
+        s.allocator.destroy(s);
+    }
+
+    fn onConnection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
+        const s: *TcpSocket = @ptrCast(@alignCast(server.*.data));
+        if (status < 0) s.listen_status = status else s.pending += 1;
+        if (s.accept_waiters.oldest()) |fiber| s.lio.wake(fiber, .normal);
+        s.lio.drain();
+    }
+
+    fn onConnect(req: [*c]uv.uv_connect_t, status: c_int) callconv(.c) void {
+        const op: *ConnectOp = @ptrCast(@alignCast(req.*.data));
+        op.status = status;
+        op.fiber.lio.wake(op.fiber, .normal);
+        op.fiber.lio.drain();
+    }
+
+    fn onAlloc(handle: [*c]uv.uv_handle_t, _: usize, buf: [*c]uv.uv_buf_t) callconv(.c) void {
+        const s: *TcpSocket = @ptrCast(@alignCast(handle.*.data));
+        if (s.read_op) |op| {
+            buf.* = uv.uv_buf_init(op.buffer.ptr, @intCast(@min(op.buffer.len, std.math.maxInt(c_uint))));
+        } else {
+            buf.* = uv.uv_buf_init(null, 0);
+        }
+    }
+
+    fn onRead(handle: [*c]uv.uv_stream_t, nread: isize, _: [*c]const uv.uv_buf_t) callconv(.c) void {
+        const s: *TcpSocket = @ptrCast(@alignCast(handle.*.data));
+        if (nread == 0) return; // nothing read (EAGAIN)
+        const op = s.read_op orelse return;
+        s.read_op = null;
+        _ = uv.uv_read_stop(handle);
+        op.result = nread;
+        s.lio.wake(op.fiber, .normal);
+        s.lio.drain();
+    }
+
+    fn onWrite(req: [*c]uv.uv_write_t, status: c_int) callconv(.c) void {
+        const op: *WriteOp = @ptrCast(@alignCast(req.*.data));
+        op.status = status;
+        op.fiber.lio.wake(op.fiber, .normal);
+        op.fiber.lio.drain();
+    }
+};
+
+const LookupOp = struct {
+    req: uv.uv_getaddrinfo_t = undefined,
+    fiber: *Fiber,
+    status: ?c_int = null,
+    res: [*c]uv.struct_addrinfo = null,
+
+    fn onResolved(req: [*c]uv.uv_getaddrinfo_t, status: c_int, res: [*c]uv.struct_addrinfo) callconv(.c) void {
+        const op: *LookupOp = @ptrCast(@alignCast(req.*.data));
+        op.status = status;
+        op.res = res;
+        op.fiber.lio.wake(op.fiber, .normal);
+        op.fiber.lio.drain();
+    }
+};
+
+fn socketKey(handle: net.Socket.Handle) usize {
+    return switch (@typeInfo(net.Socket.Handle)) {
+        .pointer => @intFromPtr(handle),
+        else => @intCast(handle),
+    };
+}
+
+fn socketHandleFromUv(fd: uv.uv_os_fd_t) net.Socket.Handle {
+    const raw = if (@typeInfo(@TypeOf(fd)) == .optional) fd.? else fd;
+    return switch (@typeInfo(net.Socket.Handle)) {
+        .pointer => @ptrCast(raw),
+        else => @intCast(raw),
+    };
+}
+
+fn uvAddress(address: *const net.IpAddress, storage: *Io.Threaded.PosixAddress) *const uv.struct_sockaddr {
+    _ = Io.Threaded.addressToPosix(address, storage);
+    return @ptrCast(storage);
+}
+
+fn addressFamily(address: *const net.IpAddress) c_int {
+    return switch (address.*) {
+        .ip4 => uv.AF_INET,
+        .ip6 => uv.AF_INET6,
+    };
+}
+
+/// Translates a libuv error code into the matching error of `E`, or `error.Unexpected`.
+fn uvError(comptime E: type, code: c_int) E {
+    const candidates: []const []const u8 = switch (code) {
+        uv.UV_ECONNREFUSED => &.{"ConnectionRefused"},
+        uv.UV_ECONNRESET, uv.UV_EPIPE => &.{"ConnectionResetByPeer"},
+        uv.UV_ECONNABORTED => &.{ "ConnectionAborted", "ConnectionResetByPeer" },
+        uv.UV_ETIMEDOUT => &.{ "ConnectionTimedOut", "Timeout" },
+        uv.UV_ENETUNREACH => &.{"NetworkUnreachable"},
+        uv.UV_EHOSTUNREACH => &.{"HostUnreachable"},
+        uv.UV_ENETDOWN => &.{"NetworkDown"},
+        uv.UV_EADDRINUSE => &.{"AddressInUse"},
+        uv.UV_EADDRNOTAVAIL => &.{"AddressUnavailable"},
+        uv.UV_EAFNOSUPPORT => &.{"AddressFamilyUnsupported"},
+        uv.UV_EACCES, uv.UV_EPERM => &.{"AccessDenied"},
+        uv.UV_EMFILE => &.{"ProcessFdQuotaExceeded"},
+        uv.UV_ENFILE => &.{"SystemFdQuotaExceeded"},
+        uv.UV_ENOMEM, uv.UV_ENOBUFS => &.{"SystemResources"},
+        uv.UV_ENOTCONN, uv.UV_ECANCELED => &.{ "SocketUnconnected", "SocketNotListening" },
+        uv.UV_EPROTONOSUPPORT => &.{"ProtocolUnsupportedBySystem"},
+        uv.UV_EAGAIN => &.{"WouldBlock"},
+        else => &.{},
+    };
+    const names = @typeInfo(E).error_set.error_names.?;
+    for (candidates) |candidate| {
+        inline for (names) |name| {
+            if (std.mem.eql(u8, name, candidate)) return @field(E, name);
+        }
+    }
+    return error.Unexpected;
+}
+
+/// An intrusive list of waiting fibers, from which `wake` removes a fiber.
+const WaitList = struct {
+    head: ?*Fiber = null,
+
+    fn insert(list: *WaitList, fiber: *Fiber) void {
+        assert(fiber.wait_list == null);
+        fiber.wait_list = list;
+        fiber.wait_prev = null;
+        fiber.wait_next = list.head;
+        if (list.head) |head| head.wait_prev = fiber;
+        list.head = fiber;
+    }
+
+    fn remove(list: *WaitList, fiber: *Fiber) void {
+        assert(fiber.wait_list == list);
+        if (fiber.wait_prev) |prev| prev.wait_next = fiber.wait_next else list.head = fiber.wait_next;
+        if (fiber.wait_next) |next| next.wait_prev = fiber.wait_prev;
+        fiber.wait_prev = null;
+        fiber.wait_next = null;
+        fiber.wait_list = null;
+    }
+
+    /// The fiber that has waited longest.
+    fn oldest(list: *WaitList) ?*Fiber {
+        var node = list.head orelse return null;
+        while (node.wait_next) |next| node = next;
+        return node;
+    }
+};
+
 const FiberQueue = struct {
     head: ?*Fiber = null,
     tail: ?*Fiber = null,
@@ -873,6 +1537,8 @@ const Fiber = struct {
     wait_cancelable: bool = false,
     woke: Woke = .normal,
     futex_address: usize = 0,
+    /// The list the fiber is waiting in (a futex bucket, a socket's accept queue), if any.
+    wait_list: ?*WaitList = null,
     wait_prev: ?*Fiber = null,
     wait_next: ?*Fiber = null,
 
@@ -884,8 +1550,9 @@ const Fiber = struct {
     const State = enum { idle, ready, running, waiting, finished };
     const Kind = enum { future, group, detached };
     const CancelStatus = enum { none, requested, acknowledged };
-    const Wait = enum { none, futex, sleep, await, group_await, offload };
-    const Woke = enum { normal, timeout, canceled };
+    const Wait = enum { none, futex, sleep, await, group_await, offload, socket, dns };
+    /// `closed`: the socket the fiber was waiting on was closed.
+    const Woke = enum { normal, timeout, canceled, closed };
 
     const Platform = if (is_windows) *anyopaque else struct {
         context: Io.fiber.Context,
@@ -1279,17 +1946,201 @@ test "file operations are performed by the fallback Io" {
     }.run);
 }
 
-test "a blocking fallback operation does not block other tasks" {
+fn listenLocal(io: Io) !net.Server {
+    const address = try net.IpAddress.parseIp4("127.0.0.1", 0);
+    return address.listen(io, .{});
+}
+
+test "TCP sockets are managed by libuv" {
     try runOnLoop(struct {
-        fn acceptOne(io: Io, server: *Io.net.Server) !void {
-            // Blocks a worker thread until the connection below arrives.
+        fn run(io: Io) anyerror!void {
+            var server = try listenLocal(io);
+            defer server.deinit(io);
+            const lio: *Libuv = @ptrCast(@alignCast(io.userdata));
+            try testing.expect(lio.findSocket(server.socket.handle) != null);
+            try testing.expect(server.socket.address.getPort() != 0);
+
+            const client = try server.socket.address.connect(io, .{ .mode = .stream });
+            const accepted = try server.accept(io);
+            try testing.expect(lio.findSocket(client.socket.handle) != null);
+            try testing.expect(lio.findSocket(accepted.socket.handle) != null);
+            client.close(io);
+            accepted.close(io);
+            try testing.expect(lio.findSocket(client.socket.handle) == null);
+        }
+    }.run);
+}
+
+test "TCP echo of a large payload between tasks" {
+    try runOnLoop(struct {
+        fn echo(io: Io, server: *net.Server) !void {
+            const stream = try server.accept(io);
+            defer stream.close(io);
+            var read_buffer: [4096]u8 = undefined;
+            var write_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buffer);
+            var writer = stream.writer(io, &write_buffer);
+            _ = try reader.interface.streamRemaining(&writer.interface);
+            try writer.interface.flush();
+        }
+
+        fn run(io: Io) anyerror!void {
+            var server = try listenLocal(io);
+            defer server.deinit(io);
+            var echoing = io.async(echo, .{ io, &server });
+            defer echoing.cancel(io) catch {};
+
+            // Larger than the socket buffers, so writes have to wait for the peer to read.
+            const payload = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+            defer testing.allocator.free(payload);
+            for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 7);
+
+            const stream = try server.socket.address.connect(io, .{ .mode = .stream });
+            defer stream.close(io);
+
+            const Sender = struct {
+                fn send(io_: Io, s: net.Stream, data: []const u8) !void {
+                    var buffer: [8192]u8 = undefined;
+                    var writer = s.writer(io_, &buffer);
+                    try writer.interface.writeAll(data);
+                    try writer.interface.flush();
+                    try s.shutdown(io_, .send);
+                }
+            };
+            var sending = io.async(Sender.send, .{ io, stream, payload });
+            defer sending.cancel(io) catch {};
+
+            var buffer: [8192]u8 = undefined;
+            var reader = stream.reader(io, &buffer);
+            const received = try reader.interface.allocRemaining(testing.allocator, .unlimited);
+            defer testing.allocator.free(received);
+
+            try sending.await(io);
+            try echoing.await(io);
+            try testing.expectEqualSlices(u8, payload, received);
+        }
+    }.run);
+}
+
+test "accept and read can be canceled, and the socket stays usable" {
+    try runOnLoop(struct {
+        fn acceptOne(io: Io, server: *net.Server) !net.Stream {
+            return server.accept(io);
+        }
+
+        fn readSome(io: Io, stream: net.Stream, buffer: []u8) !usize {
+            var bufs = [_][]u8{buffer};
+            return stream.read(io, &bufs);
+        }
+
+        fn run(io: Io) anyerror!void {
+            var server = try listenLocal(io);
+            defer server.deinit(io);
+
+            var accepting = io.async(acceptOne, .{ io, &server });
+            try sleepMs(io, 10);
+            try testing.expectError(error.Canceled, accepting.cancel(io));
+
+            const client = try server.socket.address.connect(io, .{ .mode = .stream });
+            defer client.close(io);
+            const accepted = try server.accept(io);
+            defer accepted.close(io);
+
+            var buffer: [16]u8 = undefined;
+            var reading = io.async(readSome, .{ io, accepted, &buffer });
+            try sleepMs(io, 10);
+            try testing.expectError(error.Canceled, reading.cancel(io));
+
+            var writer = client.writer(io, &.{});
+            try writer.interface.writeAll("ping");
+            try testing.expectEqual(@as(usize, 4), try readSome(io, accepted, &buffer));
+            try testing.expectEqualStrings("ping", buffer[0..4]);
+        }
+    }.run);
+}
+
+test "closing a socket wakes the task reading from it" {
+    try runOnLoop(struct {
+        fn readSome(io: Io, stream: net.Stream) !usize {
+            var buffer: [16]u8 = undefined;
+            var bufs = [_][]u8{&buffer};
+            return stream.read(io, &bufs);
+        }
+
+        fn run(io: Io) anyerror!void {
+            var server = try listenLocal(io);
+            defer server.deinit(io);
+            const client = try server.socket.address.connect(io, .{ .mode = .stream });
+            defer client.close(io);
+            const accepted = try server.accept(io);
+
+            var reading = io.async(readSome, .{ io, accepted });
+            try sleepMs(io, 10);
+            accepted.close(io);
+            try testing.expectError(error.SocketUnconnected, reading.await(io));
+        }
+    }.run);
+}
+
+test "connecting to a port nobody listens on fails" {
+    try runOnLoop(struct {
+        fn run(io: Io) anyerror!void {
+            var server = try listenLocal(io);
+            const address = server.socket.address;
+            server.deinit(io);
+            try testing.expectError(error.ConnectionRefused, address.connect(io, .{ .mode = .stream }));
+        }
+    }.run);
+}
+
+test "host names are resolved with libuv" {
+    try runOnLoop(struct {
+        fn run(io: Io) anyerror!void {
+            const host = try net.HostName.init("localhost");
+            var buffer: [16]net.HostName.LookupResult = undefined;
+            var results: Io.Queue(net.HostName.LookupResult) = .init(&buffer);
+            try host.lookup(io, &results, .{ .port = 80, .family = .ip4 });
+
+            var addresses: usize = 0;
+            while (results.getOne(io)) |result| switch (result) {
+                .address => |address| {
+                    addresses += 1;
+                    try testing.expectEqual(@as(u16, 80), address.getPort());
+                    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, address.ip4.bytes);
+                },
+                .canonical_name => {},
+            } else |err| try testing.expectEqual(error.Closed, err);
+            try testing.expect(addresses > 0);
+
+            try testing.expectError(error.UnknownHostName, (try net.HostName.init("does-not-exist.invalid")).lookup(io, &results, .{ .port = 80 }));
+        }
+    }.run);
+}
+
+test "connecting by host name goes through lookup and connect" {
+    try runOnLoop(struct {
+        fn run(io: Io) anyerror!void {
+            const address = try net.IpAddress.parseIp4("127.0.0.1", 0);
+            var server = try address.listen(io, .{});
+            defer server.deinit(io);
+            const host = try net.HostName.init("localhost");
+            const stream = try host.connect(io, server.socket.address.getPort(), .{ .mode = .stream });
+            defer stream.close(io);
+            const accepted = try server.accept(io);
+            accepted.close(io);
+        }
+    }.run);
+}
+
+test "waiting for a connection does not block other tasks" {
+    try runOnLoop(struct {
+        fn acceptOne(io: Io, server: *net.Server) !void {
             const stream = try server.accept(io);
             stream.close(io);
         }
 
         fn run(io: Io) anyerror!void {
-            const address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-            var server = try address.listen(io, .{});
+            var server = try listenLocal(io);
             defer server.deinit(io);
 
             var accepting = io.async(acceptOne, .{ io, &server });
@@ -1302,6 +2153,34 @@ test "a blocking fallback operation does not block other tasks" {
             const stream = try server.socket.address.connect(io, .{ .mode = .stream });
             stream.close(io);
             try accepting.await(io);
+        }
+    }.run);
+}
+
+test "a blocking fallback operation (UDP) does not block other tasks" {
+    try runOnLoop(struct {
+        fn receiveOne(io: Io, socket: *const net.Socket, buffer: []u8) ![]u8 {
+            // UDP sockets are not managed by libuv: this blocks a worker thread.
+            const message = try socket.receive(io, buffer);
+            return message.data;
+        }
+
+        fn run(io: Io) anyerror!void {
+            const local = try net.IpAddress.parseIp4("127.0.0.1", 0);
+            const receiver = try local.bind(io, .{ .mode = .dgram });
+            defer receiver.close(io);
+            const sender = try local.bind(io, .{ .mode = .dgram });
+            defer sender.close(io);
+
+            var buffer: [64]u8 = undefined;
+            var receiving = io.async(receiveOne, .{ io, &receiver, &buffer });
+
+            const start = Io.Clock.Timestamp.now(io, .awake);
+            for (0..10) |_| try sleepMs(io, 10);
+            try testing.expect(elapsedMs(io, start) < 1000);
+
+            try sender.send(io, &receiver.address, "datagram");
+            try testing.expectEqualStrings("datagram", try receiving.await(io));
         }
     }.run);
 }
