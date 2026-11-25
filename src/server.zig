@@ -157,6 +157,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         bound_port: u16 = 0,
         // Only accessed from the loop thread.
         listener: ?*uv.uv_tcp_t = null,
+        /// Watches for Ctrl+C, which stops the server. Only accessed from the loop thread.
+        interrupt_signal: ?*uv.uv_signal_t = null,
 
         const Self = @This();
 
@@ -167,6 +169,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             BindFailed,
             ListenFailed,
             StopSignalInitFailed,
+            InterruptSignalInitFailed,
             IoInitFailed,
         };
 
@@ -264,7 +267,18 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             var stop_signal: uv.uv_async_t = undefined;
             try uvCheck(uv.uv_async_init(&loop, &stop_signal, onStopSignal), "initialize the stop signal", error.StopSignalInitFailed);
             stop_signal.data = self;
+
+            // libuv turns SIGINT (a console Ctrl+C event on Windows) into a regular callback on
+            // the loop, so stop() is never called from inside a signal handler. One-shot: once it
+            // fired, a second Ctrl+C gets the default behaviour and terminates the process.
+            var interrupt_signal: uv.uv_signal_t = undefined;
+            try uvCheck(uv.uv_signal_init(&loop, &interrupt_signal), "initialize the interrupt signal", error.InterruptSignalInitFailed);
+            interrupt_signal.data = self;
+            try uvCheck(uv.uv_signal_start_oneshot(&interrupt_signal, onInterrupt, uv.SIGINT), "watch for interrupts", error.InterruptSignalInitFailed);
+
+            // Set only once nothing else can fail: the defer below clears them.
             self.listener = &server;
+            self.interrupt_signal = &interrupt_signal;
 
             // Publish the stop signal. If stop() was already called (before the signal existed),
             // send it now so the loop shuts down as soon as it starts running.
@@ -284,6 +298,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 self.stop_requested = false;
                 self.mutex.unlock(sync.io());
                 self.listener = null;
+                self.interrupt_signal = null;
             }
 
             logger.info("Server listening on {s}:{d}", .{ config.listen_address, bound_port });
@@ -338,8 +353,23 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 uv.uv_close(@ptrCast(listener), null);
             }
 
+            // Closing it also restores the default SIGINT behaviour once no other server or
+            // loop in the process watches it.
+            if (self.interrupt_signal) |interrupt_signal| {
+                if (uv.uv_is_closing(@ptrCast(interrupt_signal)) == 0) {
+                    uv.uv_close(@ptrCast(interrupt_signal), null);
+                }
+            }
+
             uv.uv_walk(handle.*.loop, closeConnectionHandle, null);
             logger.info("Server stopping", .{});
+        }
+
+        // Runs on the loop thread when the process receives SIGINT (Ctrl+C).
+        fn onInterrupt(handle: [*c]uv.uv_signal_t, _: c_int) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(handle.*.data));
+            logger.info("Interrupt received", .{});
+            self.stop();
         }
 
         fn closeConnectionHandle(handle: [*c]uv.uv_handle_t, _: ?*anyopaque) callconv(.c) void {

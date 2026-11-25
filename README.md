@@ -1,9 +1,8 @@
-# A fast, asynchronous HTTP server in Zig
+# A fast, asynchronous HTTP server in Zig, using the new std.Io interface
 
 This is an implementation of an HTTP/1.1 server in Zig built upon the amazing [libuv](https://github.com/libuv/libuv).
 
-Handlers receive a standard `std.Io` and run as lightweight tasks on libuv's event loop, so a
-handler waiting on I/O (a slow database query, say) doesn't hold up other requests. It requires Zig 0.17.
+It requires Zig 0.17.
 
 ## Table of Contents
 
@@ -168,6 +167,7 @@ and the query parameters in `request.params` are available. Header names are nor
 
 `stop()` can be called from any thread. It returns immediately; `start()` returns once open
 connections have been closed and the handlers still running, which are canceled, have finished.
+Pressing Ctrl+C does the same; a second Ctrl+C during shutdown terminates the process.
 
 ```zig
 const std = @import("std");
