@@ -178,8 +178,14 @@ pub fn GenericRequest(comptime RequestContext: type) type {
         /// Returns the length of the request head (request line + headers + the empty line),
         /// or null if the head is not complete yet.
         pub fn headLength(data: []const u8) ?usize {
-            const end = mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
-            return end + 4;
+            var pos: usize = 3;
+            while (mem.indexOfScalarPos(u8, data, pos, '\n')) |lf| {
+                if (data[lf - 1] == '\r' and data[lf - 2] == '\n' and data[lf - 3] == '\r') {
+                    return lf + 1;
+                }
+                pos = lf + 1;
+            }
+            return null;
         }
 
         fn isValidMethod(method: []const u8, allowed_methods: []const []const u8) bool {
@@ -913,6 +919,30 @@ test "headLength waits for the empty line" {
     try testing.expectEqual(@as(?usize, null), Request.headLength("GET / HTTP/1.1\r\nHost: exa"));
     try testing.expectEqual(@as(?usize, null), Request.headLength("GET / HTTP/1.1\r\nHost: example.com\r\n"));
     try testing.expectEqual(@as(?usize, next_request.len), Request.headLength(next_request ++ "GET"));
+}
+
+test "headLength edge cases" {
+    const Request = GenericRequest(void);
+    try testing.expectEqual(@as(?usize, null), Request.headLength(""));
+    try testing.expectEqual(@as(?usize, null), Request.headLength("\n"));
+    try testing.expectEqual(@as(?usize, null), Request.headLength("\r\n\r"));
+    try testing.expectEqual(@as(?usize, 4), Request.headLength("\r\n\r\n"));
+    // Bare LFs and lone CRs do not terminate the head.
+    try testing.expectEqual(@as(?usize, null), Request.headLength("GET / HTTP/1.1\n\n"));
+    try testing.expectEqual(@as(?usize, null), Request.headLength("GET / HTTP/1.1\r\n\n\r\n"));
+    try testing.expectEqual(@as(?usize, 18), Request.headLength("GET / HTTP/1.1\r\n\r\n"));
+    // A head long enough to exercise the vectorized path, with many non-terminating LFs.
+    const long_head = comptime blk: {
+        var head: []const u8 = "GET / HTTP/1.1\r\n";
+        for (0..20) |_| head = head ++ "X-Header: some value here\r\n";
+        break :blk head ++ "\r\n";
+    };
+    try testing.expectEqual(@as(?usize, long_head.len), Request.headLength(long_head ++ "GET / HTTP/1.1"));
+    // Must match the reference implementation on every prefix.
+    for (0..long_head.len + 1) |n| {
+        const expected = if (mem.indexOf(u8, long_head[0..n], "\r\n\r\n")) |e| e + 4 else null;
+        try testing.expectEqual(expected, Request.headLength(long_head[0..n]));
+    }
 }
 
 /// Parses `raw` as a request head and returns the result of parseRequest.

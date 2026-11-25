@@ -29,6 +29,9 @@ const max_head_size: usize = suggested_buffer_size;
 /// Read and write buffers whose capacity grew past this (a large request or response) are
 /// freed once they are empty, so one big message does not pin memory for the whole connection.
 const max_retained_buffer_size: usize = suggested_buffer_size;
+/// How long a connection rejected mid-request keeps draining the client's input after the
+/// error response was sent (see lingeringClose).
+const linger_timeout_ms: u64 = 2000;
 
 pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = GenericRequest(RequestContext);
@@ -36,6 +39,31 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     // Requests are created and released on the loop's own context only (the handler task uses
     // a request, but never creates or destroys one).
     const RequestPool = std.heap.MemoryPool(Request);
+
+    // Where a connection is in its lifecycle (see the diagram above onConnection).
+    const Phase = enum {
+        /// Reading is started; waiting for (the rest of) a request.
+        reading,
+        /// A handler task owns the request and will produce the response.
+        processing,
+        /// A response is being written. The handler task may still be running if it timed out
+        /// and a 408 was sent in its place; afterProcess then drops its response.
+        writing,
+        /// Lingering close: the error response was sent and the write side shut down; input is
+        /// read and discarded until the client closes or the linger timer fires.
+        draining,
+        /// closeConnection was called. The state is freed once nothing is pending (tryFreeState).
+        closing,
+    };
+
+    // What onWriteComplete does once the response has been written.
+    const AfterWrite = enum {
+        /// Keep-alive: go back to reading (or dispatch an already-buffered pipelined request).
+        read_next,
+        close,
+        /// The request was rejected before all of it was read: close with lingeringClose.
+        linger,
+    };
 
     const State = struct {
         context: *anyopaque,
@@ -46,8 +74,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         /// The parsed request points into this buffer. libuv reads straight into its spare
         /// capacity (see allocBuffer), and it is kept across keep-alive requests.
         read_buf: std.ArrayList(u8),
-        /// True while reading is started on the stream (between uv_read_start and uv_read_stop).
-        reading: bool,
+        phase: Phase,
+        after_write: AfterWrite,
         /// Length of the current request's head; valid while `request` is set.
         head_len: usize,
         /// Total length (head + body) of the request being processed.
@@ -55,19 +83,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         request: ?*Request,
         /// Set by the handler task in `process`, consumed in `afterProcess`.
         response: ?*Response,
-        /// The task running the handler; valid while `processing`.
+        /// The handler task; non-null from dispatch until afterProcess, whatever the phase
+        /// (a timed-out task keeps running until its next cancelation point).
         task: ?Task,
-        /// Serialized response. It must not be touched while `writing`; afterwards it is
-        /// cleared, keeping its capacity for the next response on this connection.
+        /// Serialized response. It must not be touched while `write_in_flight`; afterwards it
+        /// is cleared, keeping its capacity for the next response on this connection.
         write_buf: std.ArrayList(u8),
-        /// True while a write is in flight.
-        writing: bool,
-        keep_alive: bool,
-        /// True while a handler task runs for the request.
-        processing: bool,
-        closing: bool,
-        /// The handler exceeded the timeout and a 408 was sent in its place.
-        timed_out: bool,
+        /// True from uv_write until onWriteComplete. Not implied by the phase: a write can
+        /// still be in flight once the connection is `.closing`.
+        write_in_flight: bool,
+        shutdown_req: uv.uv_shutdown_t,
         /// Number of libuv handles (stream + timer) that have not been closed yet.
         open_handles: u8,
     };
@@ -332,14 +357,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             self.middleware_list = middleware_list;
         }
 
-        // Connection lifecycle (all of this runs on the loop's own context, except `process`, which
-        // runs as a task: a fiber on the same thread):
-        //
-        //   reading ──(request complete)──> processing ──(afterProcess)──> writing ──(keep-alive)──> reading
-        //
-        // - While processing, reading is stopped, so the handler task has exclusive access to the
-        //   request and its buffer.
-        // - The serialized response is in `state.write_buf`, which must not be touched while `state.writing`.
+        // - Reading is started only in `.reading` and `.draining`. While processing it is stopped,
+        //   so the handler task has exclusive access to the request and its buffer.
+        // - `state.after_write` decides where `.writing` goes; it is set when the request is parsed
+        //   (keep-alive or not) or when an error response is sent.
+        // - The serialized response is in `state.write_buf`, which must not be touched while
+        //   `state.write_in_flight`.
         // - A connection owns two libuv handles (the TCP stream and the timer). Both must be closed,
         //   and no work or write may be pending, before the state can be returned to the pool.
         fn onConnection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
@@ -369,18 +392,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .timer = undefined,
                 .stream = stream,
                 .read_buf = .empty,
-                .reading = false,
+                .phase = .reading,
+                .after_write = .close,
                 .head_len = 0,
                 .request_len = 0,
                 .request = null,
                 .response = null,
                 .task = null,
                 .write_buf = .empty,
-                .writing = false,
-                .keep_alive = false,
-                .processing = false,
-                .closing = false,
-                .timed_out = false,
+                .write_in_flight = false,
+                .shutdown_req = undefined,
                 .open_handles = 0,
             };
 
@@ -409,15 +430,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
+        /// Only called in `.reading` and `.draining`.
         fn startReading(state: *State) void {
-            if (uv.uv_read_start(state.*.stream, allocBuffer, onRead) == 0) {
-                state.*.reading = true;
-            }
+            std.debug.assert(state.*.phase == .reading or state.*.phase == .draining);
+            _ = uv.uv_read_start(state.*.stream, allocBuffer, onRead);
         }
 
         fn stopReading(state: *State) void {
             _ = uv.uv_read_stop(state.*.stream);
-            state.*.reading = false;
         }
 
         /// Serializes the response into the connection's write buffer and starts writing it.
@@ -427,7 +447,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const allocator = ctx.*.allocator;
             const write_req_pool = ctx.*.write_req_allocator;
 
-            std.debug.assert(!state.*.writing);
+            std.debug.assert(!state.*.write_in_flight);
 
             response.*.serializeInto(allocator, &state.*.write_buf) catch |err| {
                 // E.g. a handler set a header containing CR/LF. Send a plain 500 instead.
@@ -454,7 +474,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 closeConnection(state);
                 return;
             }
-            state.*.writing = true;
+            state.*.write_in_flight = true;
+            state.*.phase = .writing;
         }
 
         /// Empties the write buffer once a write is done, keeping its capacity unless a large
@@ -473,12 +494,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const state: *State = @ptrCast(@alignCast(arg));
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
-            state.*.processing = false;
             state.*.task = null;
             const response = state.*.response;
             state.*.response = null;
 
-            if (!state.*.closing and !state.*.timed_out) {
+            // Any other phase means the response slot is no longer ours: the handler timed out
+            // and a 408 was sent instead (`.writing`), or the connection is `.closing`.
+            if (state.*.phase == .processing) {
                 // No timeouts while the response is being written; onWriteComplete
                 // restarts the timer for keep-alive connections.
                 _ = uv.uv_timer_stop(&state.*.timer);
@@ -490,7 +512,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     }
                     sendResponse(state, r);
                 } else {
-                    setResponseAndSend(state, 500);
+                    setResponseAndSend(state, 500, .close);
                 }
             }
 
@@ -500,7 +522,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             releaseRequest(state);
             consumeRequestBytes(state);
 
-            if (state.*.closing) {
+            if (state.*.phase == .closing) {
                 tryFreeState(state);
             }
         }
@@ -591,11 +613,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
 
-            // libuv (1.53, on Unix and Windows) calls allocBuffer and onRead back to back and
-            // never reports a read after uv_read_stop. Should that ever change, bytes arriving
-            // while the connection is not reading (e.g. a 408 is being sent) are dropped rather
-            // than appended to a buffer that may have been cleared.
-            if (nread > 0 and !state.*.reading) {
+            // Only `.reading` keeps the bytes. During a lingering close (`.draining`) they are
+            // dropped: they were read into the spare capacity, which is simply reused, and the
+            // linger timer is left alone. In every other phase reading is stopped, and libuv
+            // (1.53, on Unix and Windows) calls allocBuffer and onRead back to back and never
+            // reports a read after uv_read_stop. Should that ever change, such bytes are dropped
+            // too rather than appended to a buffer that may have been cleared.
+            if (nread > 0 and state.*.phase != .reading) {
                 return;
             }
 
@@ -604,7 +628,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     // There is no more data to be read
                     uv.UV_EOF => {},
                     else => {
-                        logger.err("Read error: {s}", .{uv.uv_strerror(@intCast(nread))});
+                        // A client that gives up on a rejected request may reset the connection.
+                        if (state.*.phase == .draining) {
+                            logger.debug("Read error while draining: {s}", .{uv.uv_strerror(@intCast(nread))});
+                        } else {
+                            logger.err("Read error: {s}", .{uv.uv_strerror(@intCast(nread))});
+                        }
                     },
                 }
                 closeConnection(state);
@@ -666,7 +695,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     return .failed;
                 };
 
-                state.*.keep_alive = request.isKeepAlive();
+                state.*.after_write = if (request.isKeepAlive()) .read_next else .close;
 
                 // Reject an oversized body up front instead of buffering it first.
                 if (request.getHeader("Content-Length")) |header| {
@@ -718,10 +747,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             state.*.task = ctx.*.lio.spawnDetached(process, afterProcess, state) catch {
                 logger.err("Failed to start a handler task", .{});
                 discardRequest(state);
-                setResponseAndSend(state, 503);
+                setResponseAndSend(state, 503, .close);
                 return .failed;
             };
-            state.*.processing = true;
+            state.*.phase = .processing;
             _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
 
             // Run the handler now rather than in the loop's next idle phase: deferring it costs a
@@ -738,10 +767,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             ctx.*.write_req_allocator.destroy(req);
 
-            state.*.writing = false;
+            state.*.write_in_flight = false;
             resetWriteBuf(state);
 
-            if (state.*.closing) {
+            if (state.*.phase == .closing) {
                 tryFreeState(state);
                 return;
             }
@@ -752,11 +781,21 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
 
-            if (!state.*.keep_alive) {
-                closeConnection(state);
-                return;
+            switch (state.*.after_write) {
+                .close => {
+                    closeConnection(state);
+                    return;
+                },
+                .linger => {
+                    lingeringClose(state);
+                    return;
+                },
+                .read_next => {},
             }
 
+            // A keep-alive response is only sent after the handler finished.
+            std.debug.assert(state.*.task == null);
+            state.*.phase = .reading;
             _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
 
             // A pipelined request may already be fully buffered. No read event will
@@ -854,13 +893,15 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             state.*.request_len = 0;
         }
 
-        /// Sends an error response and closes the connection once it has been written.
-        fn setResponseAndSend(state: *State, code: u16) void {
+        /// Sends an error response; once it has been written, the connection is closed the way
+        /// `after_write` says (`.close` or `.linger`).
+        fn setResponseAndSend(state: *State, code: u16, after_write: AfterWrite) void {
+            std.debug.assert(after_write != .read_next);
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             // No more timeouts: the connection is closed as soon as the write completes.
             _ = uv.uv_timer_stop(&state.*.timer);
-            state.*.keep_alive = false;
+            state.*.after_write = after_write;
 
             const response = createResponse(ctx) catch |err| {
                 logger.err("Error creating response: {}", .{err});
@@ -873,10 +914,38 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             sendResponse(state, response);
         }
 
+        /// Rejects the request being read. The client may still be sending it (e.g. the body
+        /// of a 413), so the connection is closed with lingeringClose once the response is out.
         fn handleErrorAndStopReading(state: *State, code: u16) void {
             stopReading(state);
             discardRequest(state);
-            setResponseAndSend(state, code);
+            setResponseAndSend(state, code, .linger);
+        }
+
+        /// Closing a socket that still has unread input makes the OS send a RST, which can
+        /// destroy the error response before the client reads it. Instead (RFC 9112 §9.6),
+        /// half-close the connection, which sends a FIN once the response is out, and keep
+        /// reading and discarding input until the client closes its side or linger_timeout_ms
+        /// passes.
+        fn lingeringClose(state: *State) void {
+            state.*.phase = .draining;
+            if (uv.uv_shutdown(&state.*.shutdown_req, state.*.stream, onShutdown) != 0) {
+                closeConnection(state);
+                return;
+            }
+            _ = uv.uv_timer_start(&state.*.timer, onLingerTimeout, linger_timeout_ms, 0);
+            startReading(state);
+        }
+
+        fn onShutdown(_: [*c]uv.uv_shutdown_t, _: c_int) callconv(.c) void {
+            // Nothing to do: the connection is closed on EOF, a read error or the linger timer.
+            // shutdown_req lives in State, which is freed only after the stream's close callback,
+            // and libuv completes (or cancels) the shutdown before that.
+        }
+
+        fn onLingerTimeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
+            const state: *State = @ptrCast(@alignCast(timer.*.data));
+            closeConnection(state);
         }
 
         // The timer runs while the connection is reading and while a request is being processed.
@@ -884,35 +953,36 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         fn onTimeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
             const state: *State = @ptrCast(@alignCast(timer.*.data));
 
-            if (state.*.processing) {
+            if (state.*.phase == .processing) {
                 // The handler is taking too long. Answer 408 now, close the connection once it
                 // is written, and cancel the handler: its next cancelation point (or the one it
                 // is waiting in) returns error.Canceled. The task still owns the request, so it
-                // is left alone: afterProcess drops the handler's response and releases it.
+                // is left alone: sending moves the phase to `.writing`, so afterProcess drops
+                // the handler's response and only releases the request.
                 logger.debug("Request handler exceeded the timeout", .{});
-                state.*.timed_out = true;
                 const ctx: *Context = @ptrCast(@alignCast(state.*.context));
                 ctx.*.lio.cancelTask(state.*.task.?);
-                setResponseAndSend(state, 408);
+                setResponseAndSend(state, 408, .close);
                 return;
             }
 
+            std.debug.assert(state.*.phase == .reading);
             logger.debug("Connection closing due to inactivity", .{});
             stopReading(state);
             discardRequest(state);
-            setResponseAndSend(state, 408);
+            setResponseAndSend(state, 408, .close);
         }
 
         /// Starts closing both handles owned by the connection. The state is freed once
         /// both close callbacks have run and no handler task or write is pending.
         fn closeConnection(state: *State) void {
-            if (state.*.closing) return;
-            state.*.closing = true;
+            if (state.*.phase == .closing) return;
+            state.*.phase = .closing;
 
             // Nobody is left to receive the response: cancel the handler, if one is running.
-            if (state.*.processing) {
+            if (state.*.task) |task| {
                 const ctx: *Context = @ptrCast(@alignCast(state.*.context));
-                ctx.*.lio.cancelTask(state.*.task.?);
+                ctx.*.lio.cancelTask(task);
             }
 
             _ = uv.uv_timer_stop(&state.*.timer);
@@ -927,7 +997,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         }
 
         fn tryFreeState(state: *State) void {
-            if (state.*.open_handles != 0 or state.*.processing or state.*.writing) {
+            if (state.*.open_handles != 0 or state.*.task != null or state.*.write_in_flight) {
                 return;
             }
 
