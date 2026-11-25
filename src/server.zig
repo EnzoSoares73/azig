@@ -40,34 +40,32 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     // a request, but never creates or destroys one).
     const RequestPool = std.heap.MemoryPool(Request);
 
-    // Where a connection is in its lifecycle (see the diagram above onConnection).
     const Phase = enum {
-        /// Reading is started; waiting for (the rest of) a request.
         reading,
-        /// A handler task owns the request and will produce the response.
         processing,
-        /// A response is being written. The handler task may still be running if it timed out
-        /// and a 408 was sent in its place; afterProcess then drops its response.
         writing,
-        /// Lingering close: the error response was sent and the write side shut down; input is
-        /// read and discarded until the client closes or the linger timer fires.
         draining,
-        /// closeConnection was called. The state is freed once nothing is pending (tryFreeState).
         closing,
     };
 
-    // What onWriteComplete does once the response has been written.
     const AfterWrite = enum {
-        /// Keep-alive: go back to reading (or dispatch an already-buffered pipelined request).
+        /// Keep-alive
         read_next,
         close,
-        /// The request was rejected before all of it was read: close with lingeringClose.
+        linger,
+    };
+
+    // Which deadline a connection is waiting on (see armDeadline).
+    const DeadlineKind = enum {
+        none,
+        // `Context.timeout`: inactivity while reading, or a handler taking too long.
+        timeout,
+        // `linger_timeout_ms`: how long a lingering close keeps draining input.
         linger,
     };
 
     const State = struct {
         context: *anyopaque,
-        timer: uv.uv_timer_t,
         stream: [*c]uv.uv_stream_t,
         /// Bytes read from the connection that have not been consumed yet: the request being
         /// read or processed, possibly followed by the start of the next (pipelined) request.
@@ -93,11 +91,15 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         /// still be in flight once the connection is `.closing`.
         write_in_flight: bool,
         shutdown_req: uv.uv_shutdown_t,
-        /// Number of libuv handles (stream + timer) that have not been closed yet.
-        open_handles: u8,
+        /// False once the stream's close callback has run.
+        stream_open: bool,
+        /// The deadline list the connection is in, if any (see armDeadline).
+        deadline_kind: DeadlineKind,
+        /// Loop time (uv_now) at which the deadline expires; valid unless `deadline_kind` is `.none`.
+        deadline: u64,
+        deadline_node: std.DoublyLinkedList.Node,
     };
 
-    // Only used from the loop thread.
     const StatePool = std.heap.MemoryPool(State);
 
     const CallbackFn = Callback(AppContext, RequestContext);
@@ -119,9 +121,19 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         map_allocator: *StringMapPool,
         app_context: *AppContext,
         middleware_list: []const MiddlewareFn,
-        /// Runs the handlers, as fibers on the event loop.
         lio: *Libuv,
         timeout: u64,
+        /// One timer drives every connection's deadline. Connections are kept in one list per
+        /// duration: a connection is (re)armed by moving it to the end of its list, so each list
+        /// stays sorted by deadline, re-arming is O(1) and never touches libuv, and the timer
+        /// only needs to fire for the earliest head. See armDeadline and onDeadlineTimer.
+        deadline_timer: uv.uv_timer_t,
+        /// When `deadline_timer` is due (loop time), null if it is not running. It may be due
+        /// before any deadline (the connection it was set for was disarmed): it then just
+        /// reschedules itself.
+        deadline_timer_due: ?u64,
+        timeout_list: std.DoublyLinkedList,
+        linger_list: std.DoublyLinkedList,
         max_payload_size: u64,
         allowed_methods: []const []const u8,
     };
@@ -206,6 +218,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             // bind error), lets every close callback and in-flight request finish, then
             // closes the loop.
             defer closeLoop(&loop);
+
+            // Closed by closeLoop like any other handle left open; it never keeps the loop
+            // running by itself, since it is stopped whenever no connection has a deadline.
+            try uvCheck(uv.uv_timer_init(&loop, &ctx.*.deadline_timer), "initialize the deadline timer", error.LoopInitFailed);
+            ctx.*.deadline_timer.data = ctx;
+            ctx.*.deadline_timer_due = null;
+            ctx.*.timeout_list = .{};
+            ctx.*.linger_list = .{};
 
             // The Io the handlers run on. Its deinit runs before closeLoop (defers run in
             // reverse), once uv_run has returned, i.e. once every handler task has finished.
@@ -326,7 +346,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (uv.uv_is_closing(handle) != 0) return;
 
             // The listener and the stop signal are already closing, so every remaining TCP
-            // handle is a client connection. Its timer is closed by closeConnection.
+            // handle is a client connection.
             if (uv.uv_handle_get_type(handle) == @as(uv.uv_handle_type, uv.UV_TCP)) {
                 const state: *State = @ptrCast(@alignCast(handle.*.data));
                 closeConnection(state);
@@ -363,8 +383,9 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         //   (keep-alive or not) or when an error response is sent.
         // - The serialized response is in `state.write_buf`, which must not be touched while
         //   `state.write_in_flight`.
-        // - A connection owns two libuv handles (the TCP stream and the timer). Both must be closed,
-        //   and no work or write may be pending, before the state can be returned to the pool.
+        // - A connection owns one libuv handle, the TCP stream. It must be closed, and no work or
+        //   write may be pending, before the state can be returned to the pool. Its timeouts are
+        //   entries in the server's deadline lists (see armDeadline), not handles of their own.
         fn onConnection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
             const ctx: *Context = @ptrCast(@alignCast(server.*.data));
             const client_pool = ctx.client_allocator;
@@ -389,7 +410,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             state.* = .{
                 .context = @ptrCast(@alignCast(ctx)),
-                .timer = undefined,
                 .stream = stream,
                 .read_buf = .empty,
                 .phase = .reading,
@@ -402,7 +422,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .write_buf = .empty,
                 .write_in_flight = false,
                 .shutdown_req = undefined,
-                .open_handles = 0,
+                .stream_open = false,
+                .deadline_kind = .none,
+                .deadline = 0,
+                .deadline_node = .{},
             };
 
             if (uv.uv_tcp_init(server.*.loop, client) != 0) {
@@ -412,17 +435,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
             client.*.data = state;
-            state.open_handles += 1;
-
-            _ = uv.uv_timer_init(server.*.loop, &state.timer);
-            state.timer.data = state;
-            state.open_handles += 1;
+            state.stream_open = true;
 
             if (uv.uv_accept(server, stream) == 0) {
                 logger.debug("Connection accepted", .{});
                 // Responses are written in one go, so there is nothing to gain from Nagle's algorithm.
                 _ = uv.uv_tcp_nodelay(client, 1);
-                _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
+                armDeadline(state, .timeout);
                 startReading(state);
             } else {
                 logger.debug("Connection refused", .{});
@@ -502,8 +521,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             // and a 408 was sent instead (`.writing`), or the connection is `.closing`.
             if (state.*.phase == .processing) {
                 // No timeouts while the response is being written; onWriteComplete
-                // restarts the timer for keep-alive connections.
-                _ = uv.uv_timer_stop(&state.*.timer);
+                // re-arms the deadline for keep-alive connections.
+                disarmDeadline(state);
                 if (response) |r| {
                     // A HEAD response carries the headers (including Content-Length) of the
                     // equivalent GET response, but never a body.
@@ -599,7 +618,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
         fn onRead(stream: [*c]uv.uv_stream_t, nread: isize, buf: [*c]const uv.uv_buf_t) callconv(.c) void {
             const state: *State = @ptrCast(@alignCast(stream.*.data));
-            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             if (buf.*.base == null) {
                 logger.debug("Closing connection", .{});
@@ -615,7 +633,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             // Only `.reading` keeps the bytes. During a lingering close (`.draining`) they are
             // dropped: they were read into the spare capacity, which is simply reused, and the
-            // linger timer is left alone. In every other phase reading is stopped, and libuv
+            // linger deadline is left alone. In every other phase reading is stopped, and libuv
             // (1.53, on Unix and Windows) calls allocBuffer and onRead back to back and never
             // reports a read after uv_read_stop. Should that ever change, such bytes are dropped
             // too rather than appended to a buffer that may have been cleared.
@@ -640,7 +658,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return;
             }
 
-            _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
+            armDeadline(state, .timeout);
 
             // libuv read straight into read_buf's spare capacity (see allocBuffer).
             const new_read: usize = @intCast(nread);
@@ -740,7 +758,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             // The handler task now owns the request: stop reading so no new data can touch it
             // (reading restarts once the response has been written, see onWriteComplete).
-            // The timer is restarted to give the handler the full timeout: if it takes longer,
+            // The deadline is re-armed to give the handler the full timeout: if it takes longer,
             // the client gets a 408 and the task is canceled (see onTimeout).
             stopReading(state);
 
@@ -751,7 +769,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 return .failed;
             };
             state.*.phase = .processing;
-            _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
+            armDeadline(state, .timeout);
 
             // Run the handler now rather than in the loop's next idle phase: deferring it costs a
             // whole loop iteration per request, which under load cut throughput by about 25%.
@@ -796,7 +814,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             // A keep-alive response is only sent after the handler finished.
             std.debug.assert(state.*.task == null);
             state.*.phase = .reading;
-            _ = uv.uv_timer_start(&state.*.timer, onTimeout, ctx.*.timeout, 0);
+            armDeadline(state, .timeout);
 
             // A pipelined request may already be fully buffered. No read event will
             // arrive for it, so handle it now.
@@ -900,7 +918,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             // No more timeouts: the connection is closed as soon as the write completes.
-            _ = uv.uv_timer_stop(&state.*.timer);
+            disarmDeadline(state);
             state.*.after_write = after_write;
 
             const response = createResponse(ctx) catch |err| {
@@ -933,26 +951,114 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 closeConnection(state);
                 return;
             }
-            _ = uv.uv_timer_start(&state.*.timer, onLingerTimeout, linger_timeout_ms, 0);
+            armDeadline(state, .linger);
             startReading(state);
         }
 
         fn onShutdown(_: [*c]uv.uv_shutdown_t, _: c_int) callconv(.c) void {
-            // Nothing to do: the connection is closed on EOF, a read error or the linger timer.
+            // Nothing to do: the connection is closed on EOF, a read error or the linger deadline.
             // shutdown_req lives in State, which is freed only after the stream's close callback,
             // and libuv completes (or cancels) the shutdown before that.
         }
 
-        fn onLingerTimeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
-            const state: *State = @ptrCast(@alignCast(timer.*.data));
-            closeConnection(state);
+        fn listFor(ctx: *Context, kind: DeadlineKind) *std.DoublyLinkedList {
+            return switch (kind) {
+                .timeout => &ctx.*.timeout_list,
+                .linger => &ctx.*.linger_list,
+                .none => unreachable,
+            };
         }
 
-        // The timer runs while the connection is reading and while a request is being processed.
-        // It is stopped while a response is being written, so it never races with a pending write.
-        fn onTimeout(timer: [*c]uv.uv_timer_t) callconv(.c) void {
-            const state: *State = @ptrCast(@alignCast(timer.*.data));
+        /// Sets the connection's deadline to now + the kind's duration, replacing any
+        /// previous one. Hot path (every read): two list operations, plus a libuv call only
+        /// when the shared timer is idle or due later than this deadline.
+        fn armDeadline(state: *State, kind: DeadlineKind) void {
+            std.debug.assert(kind != .none);
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
+            disarmDeadline(state);
+
+            const now = uv.uv_now(ctx.*.deadline_timer.loop);
+            const duration = switch (kind) {
+                .timeout => ctx.*.timeout,
+                .linger => linger_timeout_ms,
+                .none => unreachable,
+            };
+            state.*.deadline = now + duration;
+            state.*.deadline_kind = kind;
+            // Every entry of a list has the same duration and uv_now never goes back, so
+            // appending keeps the list sorted by deadline.
+            listFor(ctx, kind).append(&state.*.deadline_node);
+
+            if (ctx.*.deadline_timer_due == null or state.*.deadline < ctx.*.deadline_timer_due.?) {
+                scheduleDeadlineTimer(ctx, now, state.*.deadline);
+            }
+        }
+
+        fn disarmDeadline(state: *State) void {
+            if (state.*.deadline_kind == .none) return;
+            const ctx: *Context = @ptrCast(@alignCast(state.*.context));
+
+            listFor(ctx, state.*.deadline_kind).remove(&state.*.deadline_node);
+            state.*.deadline_kind = .none;
+            state.*.deadline_node = .{};
+
+            // Don't let a timer with nothing to do keep the loop alive (e.g. during shutdown).
+            if (ctx.*.timeout_list.first == null and ctx.*.linger_list.first == null and ctx.*.deadline_timer_due != null) {
+                _ = uv.uv_timer_stop(&ctx.*.deadline_timer);
+                ctx.*.deadline_timer_due = null;
+            }
+        }
+
+        fn scheduleDeadlineTimer(ctx: *Context, now: u64, due: u64) void {
+            ctx.*.deadline_timer_due = due;
+            _ = uv.uv_timer_start(&ctx.*.deadline_timer, onDeadlineTimer, due -| now, 0);
+        }
+
+        fn onDeadlineTimer(timer: [*c]uv.uv_timer_t) callconv(.c) void {
+            const ctx: *Context = @ptrCast(@alignCast(timer.*.data));
+            ctx.*.deadline_timer_due = null;
+            const now = uv.uv_now(timer.*.loop);
+
+            expireDeadlines(ctx, .timeout, now);
+            expireDeadlines(ctx, .linger, now);
+
+            // The handlers above may have armed new deadlines (and scheduled the timer), but
+            // never one earlier than the remaining heads.
+            var next: ?u64 = null;
+            for ([_]DeadlineKind{ .timeout, .linger }) |kind| {
+                if (listFor(ctx, kind).first) |node| {
+                    const state: *State = @fieldParentPtr("deadline_node", node);
+                    if (next == null or state.*.deadline < next.?) next = state.*.deadline;
+                }
+            }
+            if (next) |due| {
+                if (ctx.*.deadline_timer_due != due) scheduleDeadlineTimer(ctx, now, due);
+            } else if (ctx.*.deadline_timer_due != null) {
+                _ = uv.uv_timer_stop(&ctx.*.deadline_timer);
+                ctx.*.deadline_timer_due = null;
+            }
+        }
+
+        fn expireDeadlines(ctx: *Context, kind: DeadlineKind, now: u64) void {
+            const list = listFor(ctx, kind);
+            while (list.first) |node| {
+                const state: *State = @fieldParentPtr("deadline_node", node);
+                if (state.*.deadline > now) break;
+                // Removed before the handler runs: it may close the connection.
+                disarmDeadline(state);
+                switch (kind) {
+                    .timeout => onTimeout(state),
+                    .linger => closeConnection(state),
+                    .none => unreachable,
+                }
+            }
+        }
+
+        // The timeout deadline is armed while the connection is reading and while a request is
+        // being processed. It is disarmed while a response is being written, so it never races
+        // with a pending write.
+        fn onTimeout(state: *State) void {
             if (state.*.phase == .processing) {
                 // The handler is taking too long. Answer 408 now, close the connection once it
                 // is written, and cancel the handler: its next cancelation point (or the one it
@@ -973,8 +1079,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             setResponseAndSend(state, 408, .close);
         }
 
-        /// Starts closing both handles owned by the connection. The state is freed once
-        /// both close callbacks have run and no handler task or write is pending.
+        /// Starts closing the connection's stream. The state is freed once its close callback
+        /// has run and no handler task or write is pending.
         fn closeConnection(state: *State) void {
             if (state.*.phase == .closing) return;
             state.*.phase = .closing;
@@ -985,19 +1091,18 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 ctx.*.lio.cancelTask(task);
             }
 
-            _ = uv.uv_timer_stop(&state.*.timer);
+            disarmDeadline(state);
             uv.uv_close(@ptrCast(@alignCast(state.*.stream)), onHandleClosed);
-            uv.uv_close(@ptrCast(@alignCast(&state.*.timer)), onHandleClosed);
         }
 
         fn onHandleClosed(handle: [*c]uv.uv_handle_t) callconv(.c) void {
             const state: *State = @ptrCast(@alignCast(handle.*.data));
-            state.*.open_handles -= 1;
+            state.*.stream_open = false;
             tryFreeState(state);
         }
 
         fn tryFreeState(state: *State) void {
-            if (state.*.open_handles != 0 or state.*.task != null or state.*.write_in_flight) {
+            if (state.*.stream_open or state.*.task != null or state.*.write_in_flight) {
                 return;
             }
 
