@@ -43,7 +43,8 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    var server = azig.Server.init(allocator, .{}, onResponse, {});
+    var server = try azig.Server.init(allocator, .{}, onResponse, {});
+    defer server.deinit();
     try server.start();
 }
 
@@ -59,7 +60,7 @@ your handlers share.
 
 ## Configuration
 
-`Server.init` takes a `Config` (known at compile time). Every field has a default:
+`Server.init` takes a `Config` (known at compile time); call `deinit` on the server once `start()` has returned. Every field has a default:
 
 | Field              | Default                                          | Description                                                                                             |
 |--------------------|--------------------------------------------------|---------------------------------------------------------------------------------------------------------|
@@ -72,7 +73,7 @@ your handlers share.
 | `allowed_methods`  | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`  | Requests with any other method get a `405`.                                                             |
 
 ```zig
-var server = azig.Server.init(allocator, .{
+var server = try azig.Server.init(allocator, .{
     .port = 8080,
     .listen_address = "127.0.0.1",
     .timeout = 5_000,
@@ -126,7 +127,8 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    var server = azig.Server.init(allocator, .{}, onResponse, {});
+    var server = try azig.Server.init(allocator, .{}, onResponse, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, azig.Server.start, .{&server});
 
     // ... later, for example on shutdown:
@@ -157,7 +159,8 @@ pub fn main() !void {
 
     var app_context = AppContext{ .db_connection = 123 };
 
-    var server = azig.Server.init(allocator, .{}, onResponse, &app_context);
+    var server = try azig.Server.init(allocator, .{}, onResponse, &app_context);
+    defer server.deinit();
     try server.start();
 }
 
@@ -188,7 +191,8 @@ pub fn main() !void {
 
     var app_context = AppContext{ .db_connection = 123 };
 
-    var server = azig.Server.init(allocator, .{}, onResponse, &app_context);
+    var server = try azig.Server.init(allocator, .{}, onResponse, &app_context);
+    defer server.deinit();
     server.registerMiddlewares(&.{authenticate});
     try server.start();
 }
@@ -216,7 +220,8 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    var server = azig.Server.init(allocator, .{}, onResponse, {});
+    var server = try azig.Server.init(allocator, .{}, onResponse, {});
+    defer server.deinit();
     server.registerMiddlewares(&.{ middleware1, middleware2 });
     try server.start();
 }

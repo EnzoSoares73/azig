@@ -1,5 +1,5 @@
 const std = @import("std");
-const Mutex = @import("spin_lock.zig").SpinLock;
+const Mutex = @import("mutex.zig").Mutex;
 
 pub const Options = struct {
     growable: bool = true,
@@ -8,7 +8,7 @@ pub const Options = struct {
     max_retained_capacity: u32 = 64,
 };
 
-pub const MemoryPoolError = error{OutOfMemory};
+pub const MemoryPoolError = Mutex.InitError;
 
 /// A thread-safe pool of `StringHashMap([]const u8)`.
 ///
@@ -28,7 +28,7 @@ pub fn MapPool(comptime options: Options) type {
         /// Every map ever allocated by the pool, so that `deinit` can free maps
         /// that are still in use.
         all_list: ?*Entry = null,
-        mutex: Mutex = .{},
+        mutex: Mutex,
 
         const Self = @This();
 
@@ -38,12 +38,12 @@ pub fn MapPool(comptime options: Options) type {
             next_all: ?*Entry,
         };
 
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return .{ .allocator = allocator };
+        pub fn init(allocator: std.mem.Allocator) MemoryPoolError!Self {
+            return .{ .allocator = allocator, .mutex = try Mutex.init(allocator) };
         }
 
         pub fn initPreheated(allocator: std.mem.Allocator, initial_size: usize) MemoryPoolError!Self {
-            var pool = init(allocator);
+            var pool = try init(allocator);
             errdefer pool.deinit();
             try pool.preheat(initial_size);
             return pool;
@@ -119,6 +119,7 @@ pub fn MapPool(comptime options: Options) type {
                 entry.map.deinit();
                 self.allocator.destroy(entry);
             }
+            self.mutex.deinit(self.allocator);
             self.* = undefined;
         }
     };
@@ -149,7 +150,7 @@ test "MapPool reuses maps and does not allocate on destroy" {
 }
 
 test "MapPool grows when empty and frees in-use maps on deinit" {
-    var pool = MapPool(.{}).init(testing.allocator);
+    var pool = try MapPool(.{}).init(testing.allocator);
     defer pool.deinit();
 
     const a = try pool.create();
@@ -158,7 +159,7 @@ test "MapPool grows when empty and frees in-use maps on deinit" {
 }
 
 test "MapPool shrinks maps that grew past max_retained_capacity" {
-    var pool = MapPool(.{ .max_retained_capacity = 8 }).init(testing.allocator);
+    var pool = try MapPool(.{ .max_retained_capacity = 8 }).init(testing.allocator);
     defer pool.deinit();
 
     const map = try pool.create();

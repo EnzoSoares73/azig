@@ -8,7 +8,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = azig.Server.init(allocator, azig.Config{}, onResponse, {});
+    var server = try azig.Server.init(allocator, azig.Config{}, onResponse, {});
+    defer server.deinit();
     try server.start();
 }
 

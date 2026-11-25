@@ -57,7 +57,7 @@ test "GenericAction with void AppContext calls callback when no middlewares" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -104,7 +104,7 @@ test "should return early if middleware does not call next()" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -160,7 +160,7 @@ test "should call middlewares in order" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -229,7 +229,7 @@ test "error raised by callback is captured" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 

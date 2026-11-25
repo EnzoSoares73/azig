@@ -19,7 +19,7 @@ const errorToStatusCode = @import("http_error.zig").errorToStatusCode;
 const HttpError = @import("http_error.zig").HttpError;
 const toHttpError = @import("http_error.zig").toHttpError;
 
-const SpinLock = @import("pools/spin_lock.zig").SpinLock;
+const Mutex = @import("pools/mutex.zig").Mutex;
 const logger = std.log.scoped(.server);
 
 /// Largest accepted request head (request line + headers). Larger heads get a 431.
@@ -107,7 +107,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         // loop directly: it wakes the loop thread through `stop_signal` (uv_async_send is the
         // only thread-safe libuv call). `mutex` guards both fields, so `stop()` can never send
         // on a handle that is closing or whose memory is gone.
-        mutex: SpinLock = .init,
+        mutex: Mutex,
         stop_signal: ?*uv.uv_async_t = null,
         stop_requested: bool = false,
         /// The port actually bound while the server is listening (resolves `.port = 0` to the
@@ -127,14 +127,21 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             StopSignalInitFailed,
         };
 
-        pub fn init(allocator: mem.Allocator, comptime config: Config, callback: CallbackFn, app_context: if (AppContext == void) void else *AppContext) Self {
+        /// Call `deinit` once the server is no longer used (after `start()` has returned).
+        pub fn init(allocator: mem.Allocator, comptime config: Config, callback: CallbackFn, app_context: if (AppContext == void) void else *AppContext) Mutex.InitError!Self {
             return Self{
                 .allocator = allocator,
                 .config = config,
                 .callback = callback,
                 .app_context = app_context,
                 .middleware_list = &.{},
+                .mutex = try Mutex.init(allocator),
             };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.mutex.deinit(self.allocator);
+            self.* = undefined;
         }
 
         /// Runs the server on the calling thread. Blocks until `stop()` is called (from any
@@ -1011,7 +1018,8 @@ test "start returns an error when the port is already in use" {
         }
     }.run;
 
-    var first = TestServer.init(allocator, .{ .port = 0 }, onResponse, {});
+    var first = try TestServer.init(allocator, .{ .port = 0 }, onResponse, {});
+    defer first.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&first});
     defer {
         first.stop();
@@ -1020,7 +1028,8 @@ test "start returns an error when the port is already in use" {
 
     const port = try waitUntilListening(&first);
 
-    var second = TestServer.init(allocator, .{}, onResponse, {});
+    var second = try TestServer.init(allocator, .{}, onResponse, {});
+    defer second.deinit();
     second.config.port = port;
     if (second.start()) |_| {
         return error.TestUnexpectedResult;
@@ -1041,7 +1050,8 @@ test "stop called before start makes start return" {
         fn onResponse(_: *Request, _: *Response) !void {}
     }.onResponse;
 
-    var server = TestServer.init(allocator, .{ .port = 2602 }, onResponse, {});
+    var server = try TestServer.init(allocator, .{ .port = 2602 }, onResponse, {});
+    defer server.deinit();
     server.stop();
     // Would block forever if the early stop request were lost.
     try server.start();
@@ -1085,7 +1095,8 @@ test "testing server" {
         }
     }.run;
 
-    var server = TestServer.init(allocator, .{}, onResponse, {});
+    var server = try TestServer.init(allocator, .{}, onResponse, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
@@ -1284,9 +1295,10 @@ test "should handle mid-request timeout gracefully" {
         }
     }.run;
 
-    var server = TestServer.init(allocator, Config{
+    var server = try TestServer.init(allocator, Config{
         .timeout = 100,
     }, onResponse, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
@@ -1331,9 +1343,10 @@ test "should handle mid-request timeout gracefully, where afterProcess is called
         }
     }.run;
 
-    var server = TestServer.init(allocator, Config{
+    var server = try TestServer.init(allocator, Config{
         .timeout = 100,
     }, onResponse, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
@@ -1374,9 +1387,10 @@ test "should enforce max_payload_size limit" {
     }.run;
 
     const max_payload_size: u64 = comptime std.math.pow(u64, 2, 17);
-    var server = TestServer.init(allocator, Config{
+    var server = try TestServer.init(allocator, Config{
         .max_payload_size = max_payload_size,
     }, onResponse, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
@@ -1459,7 +1473,8 @@ test "should call middlewares in order" {
         }
     }.run;
 
-    var server = TestServer.init(allocator, Config{}, onResponse, {});
+    var server = try TestServer.init(allocator, Config{}, onResponse, {});
+    defer server.deinit();
     server.registerMiddlewares(&.{ mid1, mid2, mid3 });
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
@@ -1530,7 +1545,8 @@ test "pipelined requests sent in a single write are answered in order" {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
         server.stop();
@@ -1566,7 +1582,8 @@ test "pipelined requests split across reads, including a large body, are answere
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
         server.stop();
@@ -1617,7 +1634,8 @@ test "bytes sent after an inactivity timeout are ignored and the server keeps se
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, echoPathAndBody, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, echoPathAndBody, {});
+    defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
         server.stop();

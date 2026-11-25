@@ -1,10 +1,10 @@
 const std = @import("std");
 const Options = std.heap.memory_pool.Options;
-const Mutex = @import("spin_lock.zig").SpinLock;
+const Mutex = @import("mutex.zig").Mutex;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
-pub const MemoryPoolError = error{OutOfMemory};
+pub const MemoryPoolError = Mutex.InitError;
 
 pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options) type {
     if (pool_options.alignment) |a| {
@@ -28,8 +28,8 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         const Node = std.SinglyLinkedList.Node;
         const ItemPtr = *align(item_alignment.toByteUnits()) Item;
 
-        pub fn init(allocator: Allocator) Allocator.Error!Pool {
-            return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = Mutex{}, .free_list = .{} };
+        pub fn init(allocator: Allocator) MemoryPoolError!Pool {
+            return Pool{ .arena = std.heap.ArenaAllocator.init(allocator), .mutex = try Mutex.init(allocator), .free_list = .{} };
         }
 
         pub fn initPreheated(allocator: Allocator, initial_size: usize) MemoryPoolError!Pool {
@@ -40,6 +40,7 @@ pub fn ThreadSafeMemoryPool(comptime Item: type, comptime pool_options: Options)
         }
 
         pub fn deinit(pool: *Pool) void {
+            pool.mutex.deinit(pool.arena.child_allocator);
             pool.arena.deinit();
             pool.* = undefined;
         }

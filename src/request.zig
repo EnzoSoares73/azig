@@ -378,7 +378,7 @@ test "Request initialization and cleanup" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -392,7 +392,7 @@ test "parse simple GET request" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -422,7 +422,7 @@ test "parse POST request with body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -454,7 +454,7 @@ test "header name capitalization" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -482,7 +482,7 @@ test "invalid request format" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -500,7 +500,7 @@ test "request with multiple headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -530,7 +530,7 @@ test "request with empty headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -555,7 +555,7 @@ test "request with query parameters" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
 
@@ -583,7 +583,7 @@ test "test basic chunked body parsing" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -616,7 +616,7 @@ test "test with empty chunk in the middle" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -647,7 +647,7 @@ test "test with decimal chunk size" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -676,7 +676,7 @@ test "test with missing terminating chunk" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -703,7 +703,7 @@ test "test with invalid chunk size" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -730,7 +730,7 @@ test "test with chunk size too large (would go beyond end of body)" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -757,7 +757,7 @@ test "test with missing CRLF after chunk data" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -784,7 +784,7 @@ test "test with content after final chunk" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -813,7 +813,7 @@ fn testBodyLength(head: []const u8, data: []const u8) !?usize {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -921,7 +921,7 @@ fn testParse(raw: []const u8) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -940,7 +940,7 @@ test "parseRequest keeps the last value of other repeated headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -966,7 +966,7 @@ test "isKeepAlive with keep-alive header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -989,7 +989,7 @@ test "isKeepAlive with close header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1012,7 +1012,7 @@ test "isKeepAlive with no Connection header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1034,7 +1034,7 @@ test "isKeepAlive with mixed case Connection header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1057,7 +1057,7 @@ test "host validation with valid IP address" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1077,7 +1077,7 @@ test "host validation with valid IP address and port" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1097,7 +1097,7 @@ test "host validation with valid domain name" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1117,7 +1117,7 @@ test "host validation with valid domain name and subdomain" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1137,7 +1137,7 @@ test "host validation with valid domain name and port" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1157,7 +1157,7 @@ test "host validation with domain containing hyphens" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1177,7 +1177,7 @@ test "host validation with invalid domain starting with hyphen" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1197,7 +1197,7 @@ test "host validation with invalid domain ending with hyphen" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1217,7 +1217,7 @@ test "host validation with invalid domain containing invalid character" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1237,7 +1237,7 @@ test "host validation with empty host" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);
@@ -1257,7 +1257,7 @@ test "validate method function with invalid method" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var request = try GenericRequest(void).init(&map_pool);
     defer request.deinit(&map_pool);

@@ -145,7 +145,7 @@ test "Response initialization and cleanup" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -161,7 +161,7 @@ test "Response addHeader" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -180,7 +180,7 @@ test "Response toString with small response" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -203,7 +203,7 @@ test "Response toString with large response" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -228,7 +228,7 @@ test "Response status code strings" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -257,7 +257,7 @@ test "Response with no body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
     try response.addHeader("X-Empty", "true");
@@ -279,7 +279,7 @@ test "Response calculateSerializedSize" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
 
@@ -304,7 +304,7 @@ test "Response without send_body keeps Content-Length but omits the body (HEAD)"
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
     defer response.deinit(&map_pool);
@@ -325,7 +325,7 @@ test "Response addHeader rejects header injection" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
     defer response.deinit(&map_pool);
@@ -341,7 +341,7 @@ test "Response toString rejects invalid headers written to the map directly" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = StringMapPool.init(allocator);
+    var map_pool = try StringMapPool.init(allocator);
 
     var response = try Response.init(&arena, &map_pool);
     defer response.deinit(&map_pool);
