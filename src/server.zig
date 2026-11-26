@@ -18,6 +18,7 @@ const StringMapPool = @import("constants.zig").StringMapPool;
 const errorToStatusCode = @import("http_error.zig").errorToStatusCode;
 const HttpError = @import("http_error.zig").HttpError;
 const toHttpError = @import("http_error.zig").toHttpError;
+const GenericRouter = @import("router.zig").GenericRouter;
 
 const sync = @import("pools/sync.zig");
 const Libuv = @import("libuv_io.zig").Libuv;
@@ -102,16 +103,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
     const StatePool = std.heap.MemoryPool(State);
 
-    const CallbackFn = Callback(AppContext, RequestContext);
-
     const Action = GenericAction(AppContext, RequestContext);
 
-    const MiddlewareFn = Middleware(AppContext, RequestContext);
+    const Router = GenericRouter(AppContext, RequestContext);
 
     //Application-wide context
     const Context = struct {
-        allocator: std.mem.Allocator,
-        callback: CallbackFn,
+        allocator: mem.Allocator,
         request_allocator: *RequestPool,
         response_allocator: *ResponsePool,
         client_allocator: *ClientPool,
@@ -120,7 +118,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         state_allocator: *StatePool,
         map_allocator: *StringMapPool,
         app_context: *AppContext,
-        middleware_list: []const MiddlewareFn,
+        routes: Router.Table,
         lio: *Libuv,
         timeout: u64,
         /// One timer drives every connection's deadline. Connections are kept in one list per
@@ -141,9 +139,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
     return struct {
         allocator: mem.Allocator,
         config: Config = .{},
-        callback: CallbackFn,
         app_context: if (AppContext == void) void else *AppContext,
-        middleware_list: []const MiddlewareFn,
+        routes: Router.Table,
 
         // Shutdown signalling. `stop()` may be called from any thread, so it never touches the
         // loop directly: it wakes the loop thread through `stop_signal` (uv_async_send is the
@@ -174,13 +171,13 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         };
 
         /// Call `deinit` once the server is no longer used (after `start()` has returned).
-        pub fn init(allocator: mem.Allocator, comptime config: Config, callback: CallbackFn, app_context: if (AppContext == void) void else *AppContext) mem.Allocator.Error!Self {
+        /// `router` is compiled into a lookup tree at comptime; invalid route trees fail to compile.
+        pub fn init(allocator: mem.Allocator, comptime config: Config, comptime router: Router, app_context: if (AppContext == void) void else *AppContext) mem.Allocator.Error!Self {
             return Self{
                 .allocator = allocator,
                 .config = config,
-                .callback = callback,
                 .app_context = app_context,
-                .middleware_list = &.{},
+                .routes = Router.Compiled(router).table,
             };
         }
 
@@ -196,17 +193,15 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
             const allocator = self.allocator;
             const config = self.config;
-            const callback = self.callback;
             const app_context = if (AppContext == void) undefined else self.app_context;
-            const middleware_list = self.middleware_list;
+            const routes = self.routes;
 
             const ctx: *Context = try allocator.create(Context);
             defer allocator.destroy(ctx);
 
             ctx.*.allocator = allocator;
-            ctx.*.callback = callback;
             ctx.*.app_context = app_context;
-            ctx.*.middleware_list = middleware_list;
+            ctx.*.routes = routes;
             ctx.*.timeout = config.timeout;
             ctx.*.max_payload_size = config.max_payload_size;
             ctx.*.allowed_methods = config.allowed_methods;
@@ -302,6 +297,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
 
             logger.info("Server listening on {s}:{d}", .{ config.listen_address, bound_port });
+            logRoutes(ctx.*.allocator, ctx.*.routes.list);
             _ = uv.uv_run(&loop, uv.UV_RUN_DEFAULT);
         }
 
@@ -403,10 +399,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
-        pub fn registerMiddlewares(self: *Self, middleware_list: []const MiddlewareFn) void {
-            self.middleware_list = middleware_list;
-        }
-
         // - Reading is started only in `.reading` and `.draining`. While processing it is stopped,
         //   so the handler task has exclusive access to the request and its buffer.
         // - `state.after_write` decides where `.writing` goes; it is set when the request is parsed
@@ -499,8 +491,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             std.debug.assert(!state.*.write_in_flight);
 
             response.*.serializeInto(allocator, &state.*.write_buf) catch |err| {
-                // E.g. a handler set a header containing CR/LF. Send a plain 500 instead.
+                // E.g. a handler set a header containing CR/LF. Send a plain 500 instead, without
+                // the headers: the invalid one would make serialization fail again.
                 logger.err("Failed to serialize response: {}", .{err});
+                response.*.headers.clearRetainingCapacity();
                 response.*.setResponseError(500);
                 response.*.serializeInto(allocator, &state.*.write_buf) catch {
                     closeConnection(state);
@@ -596,19 +590,56 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             handleCallback(ctx, request, response);
         }
 
+        fn logRoutes(allocator: mem.Allocator, list: []const Router.RouteInfo) void {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            formatRoutes(allocator, &buf, list) catch {
+                logger.warn("Could not list the routes: out of memory", .{});
+                return;
+            };
+            logger.info("{s}", .{buf.items});
+        }
+
+        fn formatRoutes(allocator: mem.Allocator, buf: *std.ArrayList(u8), list: []const Router.RouteInfo) !void {
+            try buf.appendSlice(allocator, "\n\tRoutes:");
+            for (list) |route| {
+                const method = if (route.method) |m| @tagName(m) else "ANY";
+                try buf.print(allocator, "\n\t\t{s: <7} {s}", .{ method, route.path });
+            }
+        }
+
         fn handleCallback(ctx: *Context, request: *Request, response: *Response) void {
-            const action: Action = .{
+            const routes = ctx.*.routes;
+            const method = std.meta.stringToEnum(std.http.Method, request.*.method);
+            var action: Action = .{
                 .io = ctx.*.lio.io(),
                 .app_context = ctx.*.app_context,
                 .index = 0,
-                .middleware_list = ctx.*.middleware_list,
+                .middleware_list = undefined,
                 .request = request,
                 .response = response,
-                .callback = ctx.*.callback,
+                .callback = undefined,
             };
+            var allow: []const u8 = "";
+
+            if (routes.match(method, request.*.path, &request.*.path_params)) |entry| {
+                action.middleware_list = entry.middlewares;
+                action.callback = entry.handler.callback;
+            } else |err| {
+                // The middlewares still run
+                const miss = routes.miss(request.*.path);
+                action.middleware_list = miss.middlewares;
+                action.callback = Router.failWith(err);
+                if (err == error.MethodNotAllowed) allow = miss.allow;
+            }
+
             action.next() catch |err| {
                 const http_error = toHttpError(err, HttpError.InternalServerError);
-                response.*.setResponseError(errorToStatusCode(http_error));
+                const code = errorToStatusCode(http_error);
+                response.*.setResponseError(code);
+                if (code == 405 and allow.len > 0) {
+                    response.*.addHeader("Allow", allow) catch response.*.setResponseError(500);
+                }
             };
         }
 
@@ -1255,7 +1286,7 @@ test "start returns an error when the port is already in use" {
         }
     }.run;
 
-    var first = try TestServer.init(allocator, .{ .port = 0 }, onResponse, {});
+    var first = try TestServer.init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer first.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&first});
     defer {
@@ -1265,7 +1296,7 @@ test "start returns an error when the port is already in use" {
 
     const port = try waitUntilListening(&first);
 
-    var second = try TestServer.init(allocator, .{}, onResponse, {});
+    var second = try TestServer.init(allocator, .{}, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer second.deinit();
     second.config.port = port;
     if (second.start()) |_| {
@@ -1287,7 +1318,7 @@ test "stop called before start makes start return" {
         fn onResponse(_: std.Io, _: *Request, _: *Response) !void {}
     }.onResponse;
 
-    var server = try TestServer.init(allocator, .{ .port = 2602 }, onResponse, {});
+    var server = try TestServer.init(allocator, .{ .port = 2602 }, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer server.deinit();
     server.stop();
     // Would block forever if the early stop request were lost.
@@ -1304,19 +1335,19 @@ test "testing server" {
 
     const onResponse = struct {
         fn onResponse(_: std.Io, request: *Request, response: *Response) !void {
-            if (std.mem.eql(u8, request.path, "/")) {
+            if (mem.eql(u8, request.path, "/")) {
                 response.*.body = "Home Page";
                 try response.*.addHeader("Content-Type", "text/plain");
-            } else if (std.mem.eql(u8, request.path, "/error")) {
+            } else if (mem.eql(u8, request.path, "/error")) {
                 return HttpError.InternalServerError;
-            } else if (std.mem.eql(u8, request.path, "/bad-request")) {
+            } else if (mem.eql(u8, request.path, "/bad-request")) {
                 return HttpError.BadRequest;
-            } else if (std.mem.eql(u8, request.path, "/timeout")) {
+            } else if (mem.eql(u8, request.path, "/timeout")) {
                 response.*.setResponseError(408);
-            } else if (std.mem.eql(u8, request.path, "/custom-status")) {
+            } else if (mem.eql(u8, request.path, "/custom-status")) {
                 response.*.status_code = 201;
                 response.*.body = "Created";
-            } else if (std.mem.eql(u8, request.path, "/chunked")) {
+            } else if (mem.eql(u8, request.path, "/chunked")) {
                 response.*.body = request.body orelse "";
                 try response.*.addHeader("Content-Type", "text/plain");
             } else {
@@ -1332,7 +1363,7 @@ test "testing server" {
         }
     }.run;
 
-    var server = try TestServer.init(allocator, .{}, onResponse, {});
+    var server = try TestServer.init(allocator, .{}, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
@@ -1534,7 +1565,7 @@ test "should handle mid-request timeout gracefully" {
 
     var server = try TestServer.init(allocator, Config{
         .timeout = 100,
-    }, onResponse, {});
+    }, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
@@ -1586,7 +1617,7 @@ test "should handle mid-request timeout gracefully, where afterProcess is called
 
     var server = try TestServer.init(allocator, Config{
         .timeout = 100,
-    }, onResponse, {});
+    }, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
@@ -1630,7 +1661,7 @@ test "should enforce max_payload_size limit" {
     const max_payload_size: u64 = comptime std.math.pow(u64, 2, 17);
     var server = try TestServer.init(allocator, Config{
         .max_payload_size = max_payload_size,
-    }, onResponse, {});
+    }, .{ .handlers = &.{.any("", onResponse)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
@@ -1714,9 +1745,11 @@ test "should call middlewares in order" {
         }
     }.run;
 
-    var server = try TestServer.init(allocator, Config{}, onResponse, {});
+    var server = try TestServer.init(allocator, Config{}, .{
+        .middlewares = &.{ mid1, mid2, mid3 },
+        .handlers = &.{.any("", onResponse)},
+    }, {});
     defer server.deinit();
-    server.registerMiddlewares(&.{ mid1, mid2, mid3 });
     const thread = try std.Thread.spawn(.{}, run, .{&server});
 
     defer {
@@ -1786,7 +1819,7 @@ test "pipelined requests sent in a single write are answered in order" {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", echoPathAndBody)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -1823,7 +1856,7 @@ test "pipelined requests split across reads, including a large body, are answere
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0 }, echoPathAndBody, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", echoPathAndBody)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -1875,7 +1908,7 @@ test "bytes sent after an inactivity timeout are ignored and the server keeps se
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, echoPathAndBody, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, .{ .handlers = &.{.any("", echoPathAndBody)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -1942,7 +1975,7 @@ test "slow handlers do not stall the server" {
         }
     }.handler;
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", handler)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -2005,7 +2038,7 @@ test "handlers can run io.async tasks concurrently" {
         }
     }.handler;
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", handler)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -2043,7 +2076,7 @@ test "a handler that exceeds the timeout is canceled" {
         }
     }.handler;
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, handler, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .timeout = 100 }, .{ .handlers = &.{.any("", handler)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -2075,7 +2108,7 @@ test "stop cancels the handlers still running" {
         }
     }.handler;
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", handler)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     const port = try waitUntilListening(&server);
@@ -2149,7 +2182,7 @@ test "handlers query a TCP backend concurrently through io" {
         }
     }.handler;
 
-    var server = try Server(void, void).init(allocator, .{ .port = 0 }, handler, {});
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, .{ .handlers = &.{.any("", handler)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, runServer, .{&server});
     defer {
@@ -2177,4 +2210,166 @@ test "handlers query a TCP backend concurrently through io" {
     }
     // The eight 300 ms queries overlap.
     try testing.expect(msSince(start) < 1500);
+}
+
+fn routedUsers(_: std.Io, _: *GenericRequest(void), response: *Response) !void {
+    response.body = "list";
+}
+
+fn routedCreate(_: std.Io, _: *GenericRequest(void), response: *Response) !void {
+    response.status_code = 201;
+    response.body = "created";
+}
+
+fn routedUser(_: std.Io, request: *GenericRequest(void), response: *Response) !void {
+    response.body = try std.fmt.allocPrint(response.arena.allocator(), "user {s}", .{request.path_params.get("id").?});
+}
+
+const routed_router: GenericRouter(void, void) = .{ .handlers = &.{
+    .get("/users", routedUsers),
+    .post("/users", routedCreate),
+    .get("/users/:id", routedUser),
+} };
+
+/// Sends one request on its own connection and returns everything the server answered.
+fn routedRequest(allocator: mem.Allocator, port: u16, comptime request_line: []const u8) ![]u8 {
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, request_line ++ " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    return raw_client.receiveAll(stream, allocator);
+}
+
+test "routes are chosen by path and method" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, routed_router, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    {
+        const received = try routedRequest(allocator, port, "GET /users");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\nlist"));
+    }
+    {
+        const received = try routedRequest(allocator, port, "POST /users");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 201 Created\r\n"));
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\ncreated"));
+    }
+    {
+        const received = try routedRequest(allocator, port, "GET /users/42");
+        defer allocator.free(received);
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\nuser 42"));
+    }
+    {
+        // HEAD is answered by the GET handler, without the body.
+        const received = try routedRequest(allocator, port, "HEAD /users");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(mem.indexOf(u8, received, "Content-Length: 4\r\n") != null);
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\n"));
+    }
+    {
+        const received = try routedRequest(allocator, port, "DELETE /users");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try testing.expect(mem.indexOf(u8, received, "Allow: GET, HEAD, POST\r\n") != null);
+    }
+    {
+        const received = try routedRequest(allocator, port, "GET /nope");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 404 Not Found\r\n"));
+    }
+}
+
+var guarded_requests = std.atomic.Value(u32).init(0);
+
+fn countRequests(_: std.Io, _: *GenericRequest(void), response: *Response, action: GenericAction(void, void)) !void {
+    _ = guarded_requests.fetchAdd(1, .monotonic);
+    try response.addHeader("X-Seen", "1");
+    try action.next();
+}
+
+fn requireUser(_: std.Io, request: *GenericRequest(void), _: *Response, action: GenericAction(void, void)) !void {
+    if (request.getHeader("X-User") == null) return error.Unauthorized;
+    try action.next();
+}
+
+const guarded_router: GenericRouter(void, void) = .{
+    .middlewares = &.{countRequests},
+    .routes = &.{.{
+        .path = "/api",
+        .middlewares = &.{requireUser},
+        .handlers = &.{.get("/users", routedUsers)},
+    }},
+};
+
+fn guardedRequest(allocator: mem.Allocator, port: u16, comptime request_line: []const u8, comptime headers: []const u8) ![]u8 {
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, request_line ++ " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n" ++ headers ++ "\r\n");
+    return raw_client.receiveAll(stream, allocator);
+}
+
+test "404 and 405 run the middlewares of the routers the path is under" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    guarded_requests.store(0, .monotonic);
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, guarded_router, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // Outside "/api": only the root middleware runs.
+        .{ "GET /nope", "", "HTTP/1.1 404 Not Found\r\n" },
+        // Under "/api", its middleware rejects the request before the 404 / 405 is revealed.
+        .{ "GET /api/nope", "", "HTTP/1.1 401 Unauthorized\r\n" },
+        .{ "DELETE /api/users", "", "HTTP/1.1 401 Unauthorized\r\n" },
+        .{ "GET /api/nope", "X-User: ana\r\n", "HTTP/1.1 404 Not Found\r\n" },
+        .{ "DELETE /api/users", "X-User: ana\r\n", "HTTP/1.1 405 Method Not Allowed\r\n" },
+        .{ "GET /api/users", "X-User: ana\r\n", "HTTP/1.1 200 OK\r\n" },
+    };
+    inline for (cases) |case| {
+        const received = try guardedRequest(allocator, port, case[0], case[1]);
+        defer allocator.free(received);
+        testing.expect(mem.startsWith(u8, received, case[2])) catch |err| {
+            std.debug.print("{s} ({s}) got:\n{s}\n", .{ case[0], case[1], received });
+            return err;
+        };
+        // Headers set by middlewares survive error responses.
+        try testing.expect(mem.indexOf(u8, received, "X-Seen: 1\r\n") != null);
+        // Only the 405 the router produced carries Allow.
+        const has_allow = mem.indexOf(u8, received, "Allow: GET, HEAD\r\n") != null;
+        try testing.expectEqual(mem.startsWith(u8, case[2], "HTTP/1.1 405"), has_allow);
+    }
+    try testing.expectEqual(@as(u32, cases.len), guarded_requests.load(.monotonic));
+}
+
+test "routes are formatted as one message, without a trailing newline" {
+    const Router = GenericRouter(void, void);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try Server(void, void).formatRoutes(testing.allocator, &buf, Router.Compiled(routed_router).list ++ &[_]Router.RouteInfo{
+        .{ .method = null, .path = "/any" },
+    });
+    try testing.expectEqualStrings(
+        "Routes:\n  GET     /users\n  POST    /users\n  GET     /users/:id\n  ANY     /any",
+        buf.items,
+    );
 }

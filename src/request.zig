@@ -8,6 +8,7 @@ const testing = std.testing;
 const supported_versions = @import("constants.zig").supported_versions;
 const HttpError = @import("http_error.zig").HttpError;
 const http_header = @import("header.zig");
+const Params = @import("router.zig").Params;
 
 pub fn GenericRequest(comptime RequestContext: type) type {
     return struct {
@@ -16,6 +17,8 @@ pub fn GenericRequest(comptime RequestContext: type) type {
         version: []const u8,
         headers: *StringHashMap([]const u8),
         params: *StringHashMap([]const u8),
+        /// `:name` segments captured by the router for the matched route.
+        path_params: Params,
         body: ?[]const u8,
         context: RequestContext,
 
@@ -30,6 +33,7 @@ pub fn GenericRequest(comptime RequestContext: type) type {
                 .body = null,
                 .headers = headers,
                 .params = params,
+                .path_params = .{},
                 .method = undefined,
                 .path = undefined,
                 .version = undefined,

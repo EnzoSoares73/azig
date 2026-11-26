@@ -2,13 +2,14 @@
 
 This is an implementation of an HTTP/1.1 server in Zig built upon the amazing [libuv](https://github.com/libuv/libuv).
 
-It requires Zig 0.17.
+It requires Zig 0.17.1
 
 ## Table of Contents
 
 * [Installation](#installation)
 * [Basic use](#basic-use)
 * [Handlers and std.Io](#handlers-and-stdio)
+* [Routing](#routing)
 * [Configuration](#configuration)
 * [Responses and errors](#responses-and-errors)
 * [Stopping the server](#stopping-the-server)
@@ -45,7 +46,7 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    var server = try azig.Server.init(allocator, .{}, onResponse, {});
+    var server = try azig.Server.init(allocator, .{}, .{ .handlers = &.{.get("/", onResponse)} }, {});
     defer server.deinit();
     try server.start();
 }
@@ -57,7 +58,6 @@ fn onResponse(_: std.Io, _: *azig.Request, response: *azig.Response) !void {
 ```
 
 `start()` blocks until the server is stopped. The allocator passed to `init` must be thread-safe:
-blocking operations performed through the handlers' `io` run on worker threads.
 
 ## Handlers and std.Io
 
@@ -77,22 +77,6 @@ fn getUser(io: std.Io, request: *azig.Request, response: *azig.Response) !void {
 }
 ```
 
-Each request's handler runs as a task with its own stack (a fiber) on the server's event loop.
-When it waits through `io`, its task is suspended and the loop serves other requests, so slow
-handlers don't stall the server, and thousands of waiting handlers cost memory rather than
-threads. Under the hood, `io` is built on libuv:
-
-| Operations                                                               | Performed                                                    |
-|--------------------------------------------------------------------------|--------------------------------------------------------------|
-| Tasks, groups, cancelation, sleeping, `Io.Mutex` / `Condition` / `Queue` | On the event loop                                            |
-| TCP sockets (listen, accept, connect, read, write)                       | On the event loop, with libuv's TCP handles: no thread waits |
-| DNS lookups (`HostName.lookup`, `HostName.connect`)                      | libuv's `uv_getaddrinfo`                                     |
-| Files and directories                                                    | libuv's thread pool                                          |
-| Everything else (UDP, Unix sockets, child processes, pipes)              | Worker threads of an internal `std.Io.Threaded`              |
-
-libuv's thread pool, shared by file operations and DNS lookups, has 4 threads by default; set
-the `UV_THREADPOOL_SIZE` environment variable (up to 1024) before starting the server to change it.
-
 You must:
 
 * **Do all waiting through `io`.** Handlers run on the event loop's thread: code that blocks the
@@ -100,12 +84,62 @@ You must:
   includes libraries that keep their own `Io` (for example, one created in `main`): pass them
   the `io` the handler received.
 * **Use `io` only inside handlers**, not from other threads.
-* **Timeouts cancel the handler.** If a handler runs longer than `timeout`, the client gets a
-  `408` and the handler is canceled: its next (or current) `io` call returns `error.Canceled`.
-  The same happens when the client disconnects or the server stops. Waits, sleeps, TCP reads,
-  accepts and connects are interrupted right away; TCP writes, and file or other operations already
-  running on a thread, are not: the cancelation takes effect once they return. Use
-  `io.swapCancelProtection` to protect code that must not be interrupted.
+
+## Routing
+
+Routes are declared as a tree of `azig.Router` values. A router has a `path`, `middlewares`, its
+`handlers` and nested routers in `routes`; every field is optional. A handler is a `path`
+(relative to its router), the `method` it answers and a `callback`. `.get(path, callback)`.
+
+```zig
+const std = @import("std");
+const azig = @import("azig").Azig(void, void);
+
+const router: azig.Router = .{
+    .middlewares = &.{logRequest},
+    .handlers = &.{.get("/", home)},
+    .routes = &.{.{
+        .path = "/api/v1",
+        .middlewares = &.{authenticate},
+        .handlers = &.{
+            .get("/users", listUsers),
+            .{ .path = "/users", .method = .POST, .callback = createUser, .middlewares = &.{requireAdmin} },
+            .get("/users/me", getMe),
+            .get("/users/:id", getUser),
+            .get("/users/:id/posts/:post", getPost),
+            .get("/users/me/posts/:post", getPost),
+        },
+    }},
+};
+
+pub fn main() !void {
+    var debug_allocator = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    defer _ = debug_allocator.deinit();
+    const allocator = debug_allocator.allocator();
+
+    var server = try azig.Server.init(allocator, .{}, router, {});
+    defer server.deinit();
+    try server.start();
+}
+
+fn getPost(_: std.Io, request: *azig.Request, response: *azig.Response) !void {
+    const user_id = request.path_params.get("id").?;
+    const post_id = request.path_params.get("post").?;
+    response.body = try std.fmt.allocPrint(response.arena.allocator(), "post {s} of user {s}", .{ post_id, user_id });
+}
+```
+
+* A router's middlewares run for every route below it, from the root down: in the example,
+  `GET /api/v1/users/42` runs `logRequest`, then `authenticate`, then `getUser`, while `GET /`
+  only runs `logRequest`, then `home`. A handler's own `middlewares` run last, for that handler
+  only: `POST /api/v1/users` also runs `requireAdmin`.
+* This includes paths that match no route: their `404` (or `405`) comes after the middlewares of
+  the deepest router the path is under. `GET /api/v1/nope` runs `logRequest` and `authenticate`, so
+  an unauthenticated client gets the `401` from `authenticate` rather than learning which routes
+  exist, while `GET /nope` only runs `logRequest`. A middleware that doesn't call `action.next()`
+  stops the chain before the `404`, as usual.
+* A root router without `routes`, whose handlers have no path (`.any("", onRequest)`), handles every path.
+* The router must be known at compile time.
 
 ## Configuration
 
@@ -127,18 +161,13 @@ var server = try azig.Server.init(allocator, .{
     .port = 8080,
     .listen_address = "127.0.0.1",
     .timeout = 5_000,
-}, onResponse, {});
+}, router, {});
 ```
 
 `start()` returns an error (for example `error.BindFailed` or `error.ListenFailed` when the port is
 already in use) if the server cannot be set up.
 
 ## Responses and errors
-
-Set `response.status_code` (defaults to `200`), `response.body` and headers through
-`response.addHeader`. `Content-Length` is added automatically. `addHeader` returns
-`error.InvalidHeader` for names that are not valid header names and for values containing CR,
-LF or NUL, which would otherwise allow header injection.
 
 Memory the response needs to outlive the handler, such as a formatted body, can be allocated
 from `response.arena`, which is freed once the response has been sent:
@@ -151,7 +180,9 @@ fn onResponse(_: std.Io, request: *azig.Request, response: *azig.Response) !void
 
 Returning an error from a handler or middleware sends an error response. Errors from
 `azig.HttpError` map to their status code (`error.NotFound` becomes a `404`, and so on); any
-other error becomes a `500`.
+other error becomes a `500`. The body is dropped, but the headers set so far are kept, so headers
+a middleware adds before calling `action.next()` (CORS, request IDs, ...) are sent with error
+responses too.
 
 ```zig
 fn onResponse(_: std.Io, request: *azig.Request, _: *azig.Response) !void {
@@ -166,8 +197,7 @@ and the query parameters in `request.params` are available. Header names are nor
 ## Stopping the server
 
 `stop()` can be called from any thread. It returns immediately; `start()` returns once open
-connections have been closed and the handlers still running, which are canceled, have finished.
-Pressing Ctrl+C does the same; a second Ctrl+C during shutdown terminates the process.
+connections have been closed
 
 ```zig
 const std = @import("std");
@@ -178,7 +208,7 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    var server = try azig.Server.init(allocator, .{}, onResponse, {});
+    var server = try azig.Server.init(allocator, .{}, .{ .handlers = &.{.get("/", onResponse)} }, {});
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, azig.Server.start, .{&server});
 
@@ -210,7 +240,7 @@ pub fn main() !void {
 
     var app_context = AppContext{ .db_connection = 123 };
 
-    var server = try azig.Server.init(allocator, .{}, onResponse, &app_context);
+    var server = try azig.Server.init(allocator, .{}, .{ .handlers = &.{.get("/", onResponse)} }, &app_context);
     defer server.deinit();
     try server.start();
 }
@@ -242,9 +272,11 @@ pub fn main() !void {
 
     var app_context = AppContext{ .db_connection = 123 };
 
-    var server = try azig.Server.init(allocator, .{}, onResponse, &app_context);
+    var server = try azig.Server.init(allocator, .{}, .{
+        .middlewares = &.{authenticate},
+        .handlers = &.{.get("/", onResponse)},
+    }, &app_context);
     defer server.deinit();
-    server.registerMiddlewares(&.{authenticate});
     try server.start();
 }
 
@@ -260,7 +292,7 @@ fn onResponse(_: *AppContext, _: std.Io, request: *azig.Request, response: *azig
 
 ## Middlewares
 
-To define middlewares, use the `server.registerMiddlewares` function:
+Middlewares are set on a [`Router`](#routing), and apply to every route below it:
 
 ```zig
 const std = @import("std");
@@ -271,9 +303,11 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    var server = try azig.Server.init(allocator, .{}, onResponse, {});
+    var server = try azig.Server.init(allocator, .{}, .{
+        .middlewares = &.{ middleware1, middleware2 },
+        .handlers = &.{.get("/", onResponse)},
+    }, {});
     defer server.deinit();
-    server.registerMiddlewares(&.{ middleware1, middleware2 });
     try server.start();
 }
 
@@ -294,6 +328,6 @@ fn middleware2(_: std.Io, _: *azig.Request, _: *azig.Response, action: azig.Acti
 }
 ```
 
-The `action.next()` call runs the next middleware in the list, or the response callback when
-there are none left. A middleware that doesn't call it stops the chain, and the response it set
+The `action.next()` call runs the next middleware, or the route's handler when there are none
+left. Middlewares of nested routers come after their parents' ones. A middleware that doesn't call it stops the chain, and the response it set
 is sent as is.

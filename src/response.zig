@@ -134,7 +134,6 @@ pub const Response = struct {
     }
 
     pub fn setResponseError(self: *Self, code: u16) void {
-        self.*.headers.clearRetainingCapacity();
         self.*.body = null;
         self.*.status_code = code;
     }
@@ -348,4 +347,27 @@ test "Response toString rejects invalid headers written to the map directly" {
 
     try response.headers.put("X-Name", "value\r\n\r\ninjected body");
     try testing.expectError(Response.Error.InvalidHeader, response.toString(allocator));
+}
+
+test "Response setResponseError keeps the headers and drops the body" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var map_pool = try StringMapPool.init(allocator);
+
+    var response = try Response.init(&arena, &map_pool);
+    try response.addHeader("Access-Control-Allow-Origin", "*");
+    response.body = "partial";
+    response.setResponseError(404);
+
+    const response_str = try response.toString(allocator);
+    defer allocator.free(response_str);
+
+    try testing.expect(mem.startsWith(u8, response_str, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(mem.indexOf(u8, response_str, "Access-Control-Allow-Origin: *\r\n") != null);
+    try testing.expect(mem.indexOf(u8, response_str, "Content-Length: 0\r\n") != null);
+    try testing.expect(mem.endsWith(u8, response_str, "\r\n\r\n"));
+
+    response.deinit(&map_pool);
 }

@@ -9,6 +9,7 @@ test {
     _ = @import("header.zig");
     _ = @import("pools/sync.zig");
     _ = @import("libuv_io.zig");
+    _ = @import("router.zig");
 
     std.testing.refAllDecls(@This());
 }
