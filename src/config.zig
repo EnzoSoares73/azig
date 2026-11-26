@@ -8,7 +8,6 @@ pub const Config = struct {
     listen_address: []const u8 = constants.default_listen_address,
     max_payload_size: u64 = constants.default_max_payload_size,
     allowed_methods: []const []const u8 = constants.default_allowed_methods,
-    /// Stack size of each request handler. Handlers run as fibers on the event loop; on POSIX
-    /// systems the stack is only committed as it is used.
+    /// Stack size of each request handler. Handlers run as fibers on the event loop
     task_stack_size: usize = constants.default_task_stack_size,
 };

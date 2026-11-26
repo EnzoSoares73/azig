@@ -75,6 +75,7 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
         pub const Entry = struct {
             handler: Handler,
             middlewares: []const MiddlewareFn,
+            allow: []const u8,
         };
 
         pub const MatchError = error{
@@ -318,12 +319,15 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
                 for (nodes[0..count], 0..) |*b, i| {
                     var kvs: [b.len]struct { []const u8, u16 } = undefined;
                     for (0..b.len) |j| kvs[j] = .{ b.keys[j], b.vals[j] };
-                    const entries = b.entries[0..b.entries_len].*;
+                    var entries = b.entries[0..b.entries_len].*;
+                    const allow = allowHeader(&entries);
+                    for (&entries) |*e| e.allow = allow;
+                    const final_entries = entries; // const copy, so the pointer may escape to runtime
                     out[i] = .{
                         .static = .initComptime(kvs),
                         .param = if (b.param_name) |name| .{ .name = name, .child = b.param_child } else null,
-                        .entries = &entries,
-                        .allow = allowHeader(&entries),
+                        .entries = &final_entries,
+                        .allow = allow,
                         .mount = b.mount,
                     };
                 }
@@ -351,7 +355,7 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
                     if (e.handler.method == h.method)
                         @compileError("duplicate route: " ++ @tagName(h.method.?) ++ " " ++ n.path);
                 }
-                n.entries[n.entries_len] = .{ .handler = h, .middlewares = mws ++ h.middlewares };
+                n.entries[n.entries_len] = .{ .handler = h, .middlewares = mws ++ h.middlewares, .allow = &.{} };
                 n.entries_len += 1;
             }
 

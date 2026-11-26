@@ -15,6 +15,8 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
         request: *Request,
         response: *Response,
         index: u8,
+        /// The `Allow` value of the request's path ("GET, HEAD, PUT")
+        allow: []const u8 = "",
         app_context: *AppContext,
         middleware_list: []const Middleware(AppContext, RequestContext),
         callback: CallbackFn,
@@ -36,6 +38,7 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
                     .app_context = self.app_context,
                     .middleware_list = self.middleware_list,
                     .callback = self.callback,
+                    .allow = self.allow,
                 };
                 if (AppContext == void) {
                     try middleware(self.io, self.request, self.response, action);

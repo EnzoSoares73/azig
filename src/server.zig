@@ -625,10 +625,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             if (routes.match(method, request.*.path, &request.*.path_params)) |entry| {
                 action.middleware_list = entry.middlewares;
                 action.callback = entry.handler.callback;
+                action.allow = entry.allow;
             } else |err| {
                 // The middlewares still run
                 const miss = routes.miss(request.*.path);
                 action.middleware_list = miss.middlewares;
+                action.allow = miss.allow;
                 action.callback = Router.failWith(err);
                 if (err == error.MethodNotAllowed) allow = miss.allow;
             }
@@ -2369,7 +2371,7 @@ test "routes are formatted as one message, without a trailing newline" {
         .{ .method = null, .path = "/any" },
     });
     try testing.expectEqualStrings(
-        "Routes:\n  GET     /users\n  POST    /users\n  GET     /users/:id\n  ANY     /any",
+        "\n\tRoutes:\n\t\tGET     /users\n\t\tPOST    /users\n\t\tGET     /users/:id\n\t\tANY     /any",
         buf.items,
     );
 }

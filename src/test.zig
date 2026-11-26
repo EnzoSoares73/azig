@@ -10,6 +10,7 @@ test {
     _ = @import("pools/sync.zig");
     _ = @import("libuv_io.zig");
     _ = @import("router.zig");
+    _ = @import("middlewares/cors.zig");
 
     std.testing.refAllDecls(@This());
 }

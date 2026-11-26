@@ -14,7 +14,7 @@ pub const default_listen_address = "0.0.0.0";
 pub const default_max_payload_size: u64 = 1_048_576;
 /// Stack size of each request handler (handlers run as fibers on the event loop).
 pub const default_task_stack_size: usize = 4 * 1024 * 1024;
-pub const default_allowed_methods: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
+pub const default_allowed_methods: *const [7][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS" };
 pub const suggested_buffer_size: usize = 65536;
 /// Minimum free space handed to libuv for each read. Reads go straight into the
 /// connection's read buffer, which grows past this only for large requests.

@@ -8,5 +8,11 @@ pub fn Azig(comptime AppContext: type, comptime RequestContext: type) type {
         pub const Router = @import("router.zig").GenericRouter(AppContext, RequestContext);
         /// Errors that handlers and middlewares can return to send the matching status code.
         pub const HttpError = @import("http_error.zig").HttpError;
+        pub const CorsOptions = @import("middlewares/cors.zig").CorsOptions;
+
+        /// CORS middleware; register it first on the root router. See `CorsOptions`.
+        pub fn cors(comptime opts: CorsOptions) @import("constants.zig").Middleware(AppContext, RequestContext) {
+            return @import("middlewares/cors.zig").CorsMiddleware(AppContext, RequestContext, opts);
+        }
     };
 }
