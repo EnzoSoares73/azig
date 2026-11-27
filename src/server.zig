@@ -887,8 +887,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             return request;
         }
 
-        fn startResponse(arena: *std.heap.ArenaAllocator, map_pool: *StringMapPool, response_pool: *ResponsePool) !*Response {
-            const response = try response_pool.create();
+        fn startResponse(allocator: mem.Allocator, arena: *std.heap.ArenaAllocator, map_pool: *StringMapPool, response_pool: *ResponsePool) !*Response {
+            const response = try response_pool.create(allocator);
             errdefer response_pool.destroy(response);
             response.* = try Response.init(arena, map_pool);
             return response;
@@ -900,7 +900,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const arena_pool = ctx.*.arena_allocator;
             const allocator = ctx.*.allocator;
 
-            const arena = arena_pool.create() catch {
+            const arena = arena_pool.create(allocator) catch {
                 logger.err("There was an error initializing the arena", .{});
                 return error.ArenaInitFailed;
             };
@@ -910,7 +910,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 arena_pool.destroy(arena);
             }
 
-            return startResponse(arena, map_pool, response_pool) catch {
+            return startResponse(allocator, arena, map_pool, response_pool) catch {
                 logger.err("There was an error initializing the response", .{});
                 return error.ResponseInitFailed;
             };
@@ -1200,7 +1200,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.request_allocator.* = try RequestPool.initCapacity(allocator, pool_size);
 
             ctx.*.response_allocator = try allocator.create(ResponsePool);
-            ctx.*.response_allocator.* = try ResponsePool.initPreheated(allocator, pool_size);
+            ctx.*.response_allocator.* = try ResponsePool.initCapacity(allocator, pool_size);
 
             ctx.*.client_allocator = try allocator.create(ClientPool);
             ctx.*.client_allocator.* = try ClientPool.initCapacity(allocator, pool_size);
@@ -1209,7 +1209,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.write_req_allocator.* = try WriteReqPool.initCapacity(allocator, pool_size);
 
             ctx.*.arena_allocator = try allocator.create(ArenaPool);
-            ctx.*.arena_allocator.* = try ArenaPool.initPreheated(allocator, pool_size);
+            ctx.*.arena_allocator.* = try ArenaPool.initCapacity(allocator, pool_size);
 
             ctx.*.state_allocator = try allocator.create(StatePool);
             ctx.*.state_allocator.* = try StatePool.initCapacity(allocator, pool_size);
@@ -1224,7 +1224,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx_inner.*.request_allocator.deinit(allocator_inner);
                     allocator_inner.destroy(ctx_inner.*.request_allocator);
 
-                    ctx_inner.*.response_allocator.deinit();
+                    ctx_inner.*.response_allocator.deinit(allocator_inner);
                     allocator_inner.destroy(ctx_inner.*.response_allocator);
 
                     ctx_inner.*.client_allocator.deinit(allocator_inner);
@@ -1233,7 +1233,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx_inner.*.write_req_allocator.deinit(allocator_inner);
                     allocator_inner.destroy(ctx_inner.*.write_req_allocator);
 
-                    ctx_inner.*.arena_allocator.deinit();
+                    ctx_inner.*.arena_allocator.deinit(allocator_inner);
                     allocator_inner.destroy(ctx_inner.*.arena_allocator);
 
                     ctx_inner.*.state_allocator.deinit(allocator_inner);
