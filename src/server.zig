@@ -1,5 +1,6 @@
 /// Represents a HTTP server implementation using libuv
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const uv = @import("uv");
 const Config = @import("config.zig").Config;
@@ -23,6 +24,8 @@ const GenericRouter = @import("router.zig").GenericRouter;
 const sync = @import("pools/sync.zig");
 const Libuv = @import("libuv_io.zig").Libuv;
 const Task = @import("libuv_io.zig").Task;
+const GenericWorker = @import("worker.zig").Worker;
+const GenericAcceptor = @import("acceptor.zig").Acceptor;
 const logger = std.log.scoped(.server);
 
 /// Largest accepted request head (request line + headers). Larger heads get a 431.
@@ -134,6 +137,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         linger_list: std.DoublyLinkedList,
         max_payload_size: u64,
         allowed_methods: []const []const u8,
+        /// Receives the byte sent with each connection over the worker's IPC channel.
+        channel_buffer: [16]u8,
     };
 
     return struct {
@@ -142,20 +147,18 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         app_context: if (AppContext == void) void else *AppContext,
         routes: Router.Table,
 
-        // Shutdown signalling. `stop()` may be called from any thread, so it never touches the
-        // loop directly: it wakes the loop thread through `stop_signal` (uv_async_send is the
-        // only thread-safe libuv call). `mutex` guards both fields, so `stop()` can never send
-        // on a handle that is closing or whose memory is gone.
+        // Shutdown signalling. `stop()` may be called from any thread, so it never touches a
+        // loop directly: it wakes each worker's loop thread through the worker's `stop_signal`
+        // (uv_async_send is the only thread-safe libuv call). `mutex` guards the fields below and
+        // every worker's `stop_signal`, so `stop()` can never send on a handle that is closing or
+        // whose memory is gone.
         mutex: std.Io.Mutex = .init,
-        stop_signal: ?*uv.uv_async_t = null,
         stop_requested: bool = false,
-        /// The port actually bound while the server is listening (resolves `.port = 0` to the
-        /// port the OS picked), 0 otherwise. Guarded by `mutex`; read it with `listeningPort()`.
+        workers: []Worker = &.{},
+        /// Only in acceptor mode, while it runs.
+        acceptor: ?*Acceptor = null,
+        /// The port actually bound while the server is listening
         bound_port: u16 = 0,
-        // Only accessed from the loop thread.
-        listener: ?*uv.uv_tcp_t = null,
-        /// Watches for Ctrl+C, which stops the server. Only accessed from the loop thread.
-        interrupt_signal: ?*uv.uv_signal_t = null,
 
         const Self = @This();
 
@@ -168,7 +171,34 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             StopSignalInitFailed,
             InterruptSignalInitFailed,
             IoInitFailed,
+            WorkerSpawnFailed,
+            WorkerChannelFailed,
         };
+
+        const WorkerError = StartError || mem.Allocator.Error;
+
+        const internals = .{
+            .Server = Self,
+            .Context = Context,
+            .Error = WorkerError,
+            .initPools = initPools,
+            .closeLoop = closeLoop,
+            .uvCheck = uvCheck,
+            .bindAndListen = bindAndListen,
+            .usesReusePort = usesReusePort,
+            .watchInterrupt = watchInterrupt,
+            .logRoutes = logRoutes,
+            .closeConnectionHandle = closeConnectionHandle,
+            .acceptConnection = acceptConnection,
+            .onConnection = onConnection,
+            .isStopping = isStopping,
+        };
+        const Worker = GenericWorker(internals);
+        const Acceptor = GenericAcceptor(internals, Worker);
+        const Source = Worker.Source;
+
+        const Mode = enum { single, reuse_port, acceptor };
+        const Plan = struct { mode: Mode, workers: usize };
 
         /// Call `deinit` once the server is no longer used (after `start()` has returned).
         /// `router` is compiled into a lookup tree at comptime; invalid route trees fail to compile.
@@ -185,128 +215,114 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             self.* = undefined;
         }
 
-        /// Runs the server on the calling thread. Blocks until `stop()` is called (from any
+        /// Runs the server (see `Config.num_workers`). Blocks until `stop()` is called (from any
         /// thread) and every open connection and in-flight request has been wound down.
-        /// Returns an error if the loop cannot be set up or the address cannot be bound.
-        pub fn start(self: *Self) !void {
-            logger.info("Starting server", .{});
+        /// Returns an error if a loop cannot be set up or the address cannot be bound.
+        pub fn start(self: *Self) WorkerError!void {
+            const plan = planFor(self.config);
+            if (plan.mode == .single) {
+                logger.info("Starting server", .{});
+            } else {
+                logger.info("Starting server with {d} workers ({s})", .{ plan.workers, @tagName(plan.mode) });
+            }
 
-            const allocator = self.allocator;
-            const config = self.config;
-            const app_context = if (AppContext == void) undefined else self.app_context;
-            const routes = self.routes;
+            const workers = try self.allocator.alloc(Worker, plan.workers);
+            defer self.allocator.free(workers);
+            for (workers, 0..) |*worker, index| worker.* = .{ .server = self, .index = index };
 
-            const ctx: *Context = try allocator.create(Context);
-            defer allocator.destroy(ctx);
+            {
+                self.mutex.lockUncancelable(sync.io());
+                defer self.mutex.unlock(sync.io());
+                self.workers = workers;
+            }
+            defer {
+                self.mutex.lockUncancelable(sync.io());
+                self.workers = &.{};
+                self.bound_port = 0;
+                self.stop_requested = false;
+                self.mutex.unlock(sync.io());
+            }
 
-            ctx.*.allocator = allocator;
-            ctx.*.app_context = app_context;
-            ctx.*.routes = routes;
-            ctx.*.timeout = config.timeout;
-            ctx.*.max_payload_size = config.max_payload_size;
-            ctx.*.allowed_methods = config.allowed_methods;
-
-            const cleanup = try initPools(allocator, ctx, config.pool_size);
-            defer cleanup(allocator, ctx);
-            logger.debug("Pools allocated", .{});
-
-            var loop: uv.uv_loop_t = undefined;
-            try uvCheck(uv.uv_loop_init(&loop), "initialize the event loop", error.LoopInitFailed);
-            // Runs before the pools are cleaned up: closes whatever is still open (e.g. on a
-            // bind error), lets every close callback and in-flight request finish, then
-            // closes the loop.
-            defer closeLoop(&loop);
-
-            // Closed by closeLoop like any other handle left open; it never keeps the loop
-            // running by itself, since it is stopped whenever no connection has a deadline.
-            try uvCheck(uv.uv_timer_init(&loop, &ctx.*.deadline_timer), "initialize the deadline timer", error.LoopInitFailed);
-            ctx.*.deadline_timer.data = ctx;
-            ctx.*.deadline_timer_due = null;
-            ctx.*.timeout_list = .{};
-            ctx.*.linger_list = .{};
-
-            // The Io the handlers run on. Its deinit runs before closeLoop (defers run in
-            // reverse), once uv_run has returned, i.e. once every handler task has finished.
-            var lio: Libuv = undefined;
-            lio.init(allocator, &loop, .{ .stack_size = config.task_stack_size }) catch |err| {
-                logger.warn("Failed to initialize the Io: {}", .{err});
-                return error.IoInitFailed;
+            var acceptor: Acceptor = .{ .server = self, .workers = workers };
+            const result = switch (plan.mode) {
+                .single, .reuse_port => workers[0].run(.{ .listen = self.config.port }, if (plan.workers > 1) Worker.spawnOthers else null),
+                .acceptor => acceptor.run(),
             };
-            defer lio.deinit();
-            ctx.*.lio = &lio;
+            for (workers) |*worker| {
+                if (worker.thread) |thread| thread.join();
+            }
+            try result;
+            if (acceptor.start_error) |err| return err;
+            for (workers) |*worker| {
+                if (worker.start_error) |err| return err;
+            }
+            logger.info("Server stopped", .{});
+        }
 
-            var server: uv.uv_tcp_t = undefined;
-            try uvCheck(uv.uv_tcp_init(&loop, &server), "initialize the server handle", error.ServerInitFailed);
-            server.data = @constCast(ctx);
+        fn isStopping(self: *Self) bool {
+            self.mutex.lockUncancelable(sync.io());
+            defer self.mutex.unlock(sync.io());
+            return self.stop_requested;
+        }
 
+        fn usesReusePort(config: Config) bool {
+            return config.reuse_port and builtin.os.tag == .linux;
+        }
+
+        // How the server will work based on config
+        fn planFor(config: Config) Plan {
+            const count: usize = config.num_workers orelse std.Thread.getCpuCount() catch |err| blk: {
+                logger.warn("Failed to get the CPU count, running a single worker: {}", .{err});
+                break :blk 1;
+            };
+            if (count == 0) return .{ .mode = .single, .workers = 1 };
+            if (usesReusePort(config)) return .{ .mode = .reuse_port, .workers = count };
+            if (count == 1) return .{ .mode = .single, .workers = 1 };
+            return .{ .mode = .acceptor, .workers = count };
+        }
+
+        /// Binds `server` and starts listening; returns the bound port (resolves port 0).
+        fn bindAndListen(allocator: mem.Allocator, config: Config, server: *uv.uv_tcp_t, port: u16, reuse_port: bool, on_connection: uv.uv_connection_cb) WorkerError!u16 {
             // libuv expects a null-terminated string; the configured address is a plain slice.
             const listen_address = try allocator.dupeSentinel(u8, config.listen_address, 0);
             defer allocator.free(listen_address);
 
             var addr: uv.struct_sockaddr_in = undefined;
-            try uvCheck(uv.uv_ip4_addr(listen_address.ptr, @intCast(config.port), &addr), "parse the listen address", error.InvalidListenAddress);
+            try uvCheck(uv.uv_ip4_addr(listen_address.ptr, @intCast(port), &addr), "parse the listen address", error.InvalidListenAddress);
             // Some platforms only report errors such as EADDRINUSE from uv_listen, so both are checked.
-            try uvCheck(uv.uv_tcp_bind(&server, @ptrCast(&addr), 0), "bind the server", error.BindFailed);
-            try uvCheck(uv.uv_listen(@ptrCast(&server), config.backlog_size, onConnection), "listen", error.ListenFailed);
+            const flags: c_uint = if (reuse_port) uv.UV_TCP_REUSEPORT else 0;
+            try uvCheck(uv.uv_tcp_bind(server, @ptrCast(&addr), flags), "bind the server", error.BindFailed);
+            try uvCheck(uv.uv_listen(@ptrCast(server), config.backlog_size, on_connection), "listen", error.ListenFailed);
 
-            // With `.port = 0` the OS picks the port, so read back what was actually bound.
-            var bound_port = config.port;
-            {
-                var bound_addr: uv.struct_sockaddr_in = undefined;
-                var bound_len: c_int = @sizeOf(uv.struct_sockaddr_in);
-                if (uv.uv_tcp_getsockname(&server, @ptrCast(&bound_addr), &bound_len) == 0) {
-                    bound_port = mem.bigToNative(u16, bound_addr.sin_port);
-                }
+            var bound_addr: uv.struct_sockaddr_in = undefined;
+            var bound_len: c_int = @sizeOf(uv.struct_sockaddr_in);
+            if (uv.uv_tcp_getsockname(server, @ptrCast(&bound_addr), &bound_len) == 0) {
+                return mem.bigToNative(u16, bound_addr.sin_port);
             }
-
-            var stop_signal: uv.uv_async_t = undefined;
-            try uvCheck(uv.uv_async_init(&loop, &stop_signal, onStopSignal), "initialize the stop signal", error.StopSignalInitFailed);
-            stop_signal.data = self;
-
-            // libuv turns SIGINT (a console Ctrl+C event on Windows) into a regular callback on
-            // the loop, so stop() is never called from inside a signal handler. One-shot: once it
-            // fired, a second Ctrl+C gets the default behaviour and terminates the process.
-            var interrupt_signal: uv.uv_signal_t = undefined;
-            try uvCheck(uv.uv_signal_init(&loop, &interrupt_signal), "initialize the interrupt signal", error.InterruptSignalInitFailed);
-            interrupt_signal.data = self;
-            try uvCheck(uv.uv_signal_start_oneshot(&interrupt_signal, onInterrupt, uv.SIGINT), "watch for interrupts", error.InterruptSignalInitFailed);
-
-            // Set only once nothing else can fail: the defer below clears them.
-            self.listener = &server;
-            self.interrupt_signal = &interrupt_signal;
-
-            // Publish the stop signal. If stop() was already called (before the signal existed),
-            // send it now so the loop shuts down as soon as it starts running.
-            {
-                self.mutex.lockUncancelable(sync.io());
-                defer self.mutex.unlock(sync.io());
-                self.stop_signal = &stop_signal;
-                self.bound_port = bound_port;
-                if (self.stop_requested) {
-                    _ = uv.uv_async_send(&stop_signal);
-                }
-            }
-            defer {
-                self.mutex.lockUncancelable(sync.io());
-                self.stop_signal = null;
-                self.bound_port = 0;
-                self.stop_requested = false;
-                self.mutex.unlock(sync.io());
-                self.listener = null;
-                self.interrupt_signal = null;
-            }
-
-            logger.info("Server listening on {s}:{d}", .{ config.listen_address, bound_port });
-            logRoutes(ctx.*.allocator, ctx.*.routes.list);
-            _ = uv.uv_run(&loop, uv.UV_RUN_DEFAULT);
+            return port;
         }
 
-        /// The port the server is listening on, or null if it is not (yet) listening. Safe to
-        /// call from any thread.
+        /// libuv turns SIGINT (a console Ctrl+C event on Windows) into a regular callback on the
+        /// loop. One-shot: a second Ctrl+C gets the default behaviour and terminates the process.
+        fn watchInterrupt(self: *Self, loop: *uv.uv_loop_t, signal: *uv.uv_signal_t) StartError!void {
+            try uvCheck(uv.uv_signal_init(loop, signal), "initialize the interrupt signal", error.InterruptSignalInitFailed);
+            signal.data = self;
+            try uvCheck(uv.uv_signal_start_oneshot(signal, onInterrupt, uv.SIGINT), "watch for interrupts", error.InterruptSignalInitFailed);
+        }
+
+        /// The port the server is listening on, or null if it is not (yet) ready to serve.
+        /// Safe to call from any thread.
         pub fn listeningPort(self: *Self) ?u16 {
             self.mutex.lockUncancelable(sync.io());
             defer self.mutex.unlock(sync.io());
-            return if (self.stop_signal != null) self.bound_port else null;
+            if (self.workers.len == 0) return null;
+            for (self.workers) |*worker| {
+                if (worker.stop_signal == null) return null;
+            }
+            if (self.acceptor) |acceptor| {
+                if (!acceptor.ready) return null;
+            }
+            return self.bound_port;
         }
 
         /// Asks the server to shut down. Safe to call from any thread, and before or while
@@ -316,8 +332,11 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             defer self.mutex.unlock(sync.io());
 
             self.stop_requested = true;
-            if (self.stop_signal) |signal| {
-                _ = uv.uv_async_send(signal);
+            if (self.acceptor) |acceptor| {
+                if (acceptor.stop_signal) |signal| _ = uv.uv_async_send(signal);
+            }
+            for (self.workers) |*worker| {
+                if (worker.stop_signal) |signal| _ = uv.uv_async_send(signal);
             }
         }
 
@@ -330,38 +349,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             }
         }
 
-        // Runs on the loop thread when stop() is called. Stops accepting connections and closes
-        // every open connection, which cancels the handlers still running. uv_run then returns
-        // once all close callbacks have run and every handler task has finished (afterProcess
-        // frees their state).
-        fn onStopSignal(handle: [*c]uv.uv_async_t) callconv(.c) void {
-            const self: *Self = @ptrCast(@alignCast(handle.*.data));
-
-            {
-                self.mutex.lockUncancelable(sync.io());
-                defer self.mutex.unlock(sync.io());
-                // From now on stop() won't touch the handle, so it can be closed.
-                self.stop_signal = null;
-            }
-            uv.uv_close(@ptrCast(handle), null);
-
-            if (self.listener) |listener| {
-                uv.uv_close(@ptrCast(listener), null);
-            }
-
-            // Closing it also restores the default SIGINT behaviour once no other server or
-            // loop in the process watches it.
-            if (self.interrupt_signal) |interrupt_signal| {
-                if (uv.uv_is_closing(@ptrCast(interrupt_signal)) == 0) {
-                    uv.uv_close(@ptrCast(interrupt_signal), null);
-                }
-            }
-
-            uv.uv_walk(handle.*.loop, closeConnectionHandle, null);
-            logger.info("Server stopping", .{});
-        }
-
-        // Runs on the loop thread when the process receives SIGINT (Ctrl+C).
+        // Runs when the process receives SIGINT (Ctrl+C).
         fn onInterrupt(handle: [*c]uv.uv_signal_t, _: c_int) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(handle.*.data));
             logger.info("Interrupt received", .{});
@@ -394,8 +382,6 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const status = uv.uv_loop_close(loop);
             if (status != 0) {
                 logger.err("Failed to close the event loop: {s}", .{uv.uv_strerror(status)});
-            } else {
-                logger.info("Server stopped", .{});
             }
         }
 
@@ -409,23 +395,25 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         //   write may be pending, before the state can be returned to the pool. Its timeouts are
         //   entries in the server's deadline lists (see armDeadline), not handles of their own.
         fn onConnection(server: [*c]uv.uv_stream_t, status: c_int) callconv(.c) void {
-            const ctx: *Context = @ptrCast(@alignCast(server.*.data));
+            if (status < 0) return;
+            _ = acceptConnection(@ptrCast(@alignCast(server.*.data)), server);
+        }
+
+        /// Accepts a connection from `source`: a listener, or a worker's channel with a pending
+        /// handle. Returns false if nothing could be accepted.
+        fn acceptConnection(ctx: *Context, source: [*c]uv.uv_stream_t) bool {
             const client_pool = ctx.client_allocator;
             const state_pool = ctx.state_allocator;
 
-            if (status < 0) {
-                return;
-            }
-
             const client = client_pool.create(ctx.allocator) catch {
                 logger.err("Failed to allocate client", .{});
-                return;
+                return false;
             };
 
             const state = state_pool.create(ctx.allocator) catch {
                 logger.err("Failed to allocate state", .{});
                 client_pool.destroy(client);
-                return;
+                return false;
             };
 
             const stream: [*c]uv.uv_stream_t = @ptrCast(client);
@@ -450,16 +438,16 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 .deadline_node = .{},
             };
 
-            if (uv.uv_tcp_init(server.*.loop, client) != 0) {
+            if (uv.uv_tcp_init(source.*.loop, client) != 0) {
                 logger.err("Failed to initialize client handle", .{});
                 state_pool.destroy(state);
                 client_pool.destroy(client);
-                return;
+                return false;
             }
             client.*.data = state;
             state.stream_open = true;
 
-            if (uv.uv_accept(server, stream) == 0) {
+            if (uv.uv_accept(source, stream) == 0) {
                 logger.debug("Connection accepted", .{});
                 // Responses are written in one go, so there is nothing to gain from Nagle's algorithm.
                 _ = uv.uv_tcp_nodelay(client, 1);
@@ -469,6 +457,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 logger.debug("Connection refused", .{});
                 closeConnection(state);
             }
+            return true;
         }
 
         /// Only called in `.reading` and `.draining`.
@@ -2374,4 +2363,120 @@ test "routes are formatted as one message, without a trailing newline" {
         "\n\tRoutes:\n\t\tGET     /users\n\t\tPOST    /users\n\t\tGET     /users/:id\n\t\tANY     /any",
         buf.items,
     );
+}
+
+/// App context shared by every worker: records which threads ran a handler.
+const WorkerTestApp = struct {
+    mutex: std.Io.Mutex = .init,
+    thread_ids: [16]std.Thread.Id = undefined,
+    thread_count: usize = 0,
+    requests: std.atomic.Value(usize) = .init(0),
+
+    fn handle(app: *WorkerTestApp, _: std.Io, _: *GenericRequest(void), _: *Response) !void {
+        _ = app.requests.fetchAdd(1, .monotonic);
+        const id = std.Thread.getCurrentId();
+        // Handlers of different workers contend here, so the lock must block the thread (see
+        // `Config.num_workers`), not the task.
+        app.mutex.lockUncancelable(sync.io());
+        defer app.mutex.unlock(sync.io());
+        for (app.thread_ids[0..app.thread_count]) |known| {
+            if (known == id) return;
+        }
+        if (app.thread_count < app.thread_ids.len) {
+            app.thread_ids[app.thread_count] = id;
+            app.thread_count += 1;
+        }
+    }
+
+    fn runServer(server: *Server(WorkerTestApp, void)) !void {
+        try server.start();
+    }
+};
+
+test "reuse_port mode spreads connections across workers" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // The kernel picks a listener by hashing each connection: 64 all landing on one of 4
+    // workers is vanishingly unlikely.
+    try expectSpreadAcrossWorkers(.{ .port = 0, .reuse_port = true, .num_workers = 4 });
+}
+
+test "stop called before start makes start return with several workers" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .reuse_port = true, .num_workers = 3 }, .{ .handlers = &.{.any("", echoPathAndBody)} }, {});
+    defer server.deinit();
+    server.stop();
+    // Would block forever if any worker missed the early stop request.
+    try server.start();
+}
+
+test "num_workers and reuse_port select the mode" {
+    const TestServer = Server(void, void);
+    const Plan = TestServer.Plan;
+    try testing.expectEqual(Plan{ .mode = .single, .workers = 1 }, TestServer.planFor(.{ .num_workers = 0 }));
+    try testing.expectEqual(Plan{ .mode = .single, .workers = 1 }, TestServer.planFor(.{ .num_workers = 1 }));
+    try testing.expectEqual(Plan{ .mode = .acceptor, .workers = 8 }, TestServer.planFor(.{ .num_workers = 8 }));
+    try testing.expectEqual(Plan{ .mode = .single, .workers = 1 }, TestServer.planFor(.{ .reuse_port = true, .num_workers = 0 }));
+    const cpus = try std.Thread.getCpuCount();
+    if (builtin.os.tag == .linux) {
+        try testing.expectEqual(Plan{ .mode = .reuse_port, .workers = 8 }, TestServer.planFor(.{ .reuse_port = true, .num_workers = 8 }));
+        try testing.expectEqual(cpus, TestServer.planFor(.{ .reuse_port = true }).workers);
+    } else {
+        try testing.expectEqual(Plan{ .mode = .acceptor, .workers = 8 }, TestServer.planFor(.{ .reuse_port = true, .num_workers = 8 }));
+    }
+}
+
+fn expectSpreadAcrossWorkers(comptime config: Config) !void {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var app: WorkerTestApp = .{};
+    const TestServer = Server(WorkerTestApp, void);
+    var server = try TestServer.init(allocator, config, .{ .handlers = &.{.any("", WorkerTestApp.handle)} }, &app);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, WorkerTestApp.runServer, .{&server});
+    var stopped = false;
+    defer if (!stopped) {
+        server.stop();
+        thread.join();
+    };
+    const port = try waitUntilListening(&server);
+
+    const connection_count = 64;
+    for (0..connection_count) |_| {
+        const stream = try raw_client.connect(port);
+        defer stream.close(raw_client.io);
+        try raw_client.send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        const received = try raw_client.receiveAll(stream, allocator);
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 200 OK"));
+    }
+
+    try testing.expectEqual(@as(usize, connection_count), app.requests.load(.monotonic));
+    try testing.expect(app.thread_count >= 2);
+
+    server.stop();
+    thread.join();
+    stopped = true;
+    try testing.expectEqual(@as(?u16, null), server.listeningPort());
+}
+
+test "acceptor mode hands connections to every worker" {
+    try expectSpreadAcrossWorkers(.{ .port = 0, .num_workers = 4 });
+}
+
+test "stop called before start makes start return in acceptor mode" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .num_workers = 3 }, .{ .handlers = &.{.any("", echoPathAndBody)} }, {});
+    defer server.deinit();
+    server.stop();
+    try server.start();
 }

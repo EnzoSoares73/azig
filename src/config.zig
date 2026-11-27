@@ -10,4 +10,9 @@ pub const Config = struct {
     allowed_methods: []const []const u8 = constants.default_allowed_methods,
     /// Stack size of each request handler. Handlers run as fibers on the event loop
     task_stack_size: usize = constants.default_task_stack_size,
+    /// Linux only: each worker gets its own listener on the port (SO_REUSEPORT) and the kernel
+    /// balances connections. Other processes of the same user can then bind the port too.
+    reuse_port: bool = false,
+    // The default is the number of cpu cores
+    num_workers: ?u16 = null,
 };

@@ -6,10 +6,10 @@ pub fn main() !void {
     const allocator = std.heap.smp_allocator;
 
     const router: azig.Router = comptime .{
-        .handlers = &.{.get("/v1/api", onResponse), .put("/v1/api", onResponse)},
+        .handlers = &.{.get("", onResponse)},
     };
 
-    var server = try azig.Server.init(allocator, azig.Config{}, router, {});
+    var server = try azig.Server.init(allocator, azig.Config{ .reuse_port = true }, router, {});
     defer server.deinit();
     try server.start();
 }
