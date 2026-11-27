@@ -1,7 +1,7 @@
 const std = @import("std");
 const Middleware = @import("../constants.zig").Middleware;
-const Response = @import("../response.zig").Response;
-const GenericRequest = @import("../request.zig").GenericRequest;
+const Response = @import("../http/response.zig").Response;
+const GenericRequest = @import("../http/request.zig").GenericRequest;
 const GenericAction = @import("../action.zig").GenericAction;
 
 pub const CorsOptions = struct {

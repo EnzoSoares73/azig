@@ -1,8 +1,8 @@
 const std = @import("std");
 const Middleware = @import("constants.zig").Middleware;
 const Callback = @import("constants.zig").Callback;
-const Response = @import("response.zig").Response;
-const GenericRequest = @import("request.zig").GenericRequest;
+const Response = @import("http/response.zig").Response;
+const GenericRequest = @import("http/request.zig").GenericRequest;
 
 /// Maximum number of `:param` segments a single route may capture.
 pub const max_params = 8;
@@ -471,7 +471,7 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
 
 const testing = std.testing;
 const TestRouter = GenericRouter(void, void);
-const TestRequest = @import("request.zig").GenericRequest(void);
+const TestRequest = @import("http/request.zig").GenericRequest(void);
 const TestAction = @import("action.zig").GenericAction(void, void);
 
 fn cb(comptime tag: u8) Callback(void, void) {

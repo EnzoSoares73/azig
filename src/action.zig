@@ -1,6 +1,6 @@
 const std = @import("std");
-const GenericRequest = @import("request.zig").GenericRequest;
-const Response = @import("response.zig").Response;
+const GenericRequest = @import("http/request.zig").GenericRequest;
+const Response = @import("http/response.zig").Response;
 const Middleware = @import("constants.zig").Middleware;
 const Callback = @import("constants.zig").Callback;
 

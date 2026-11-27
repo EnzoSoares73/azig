@@ -1095,16 +1095,15 @@ pub const Libuv = struct {
 
     /// Operations that never block for long, run directly on the calling thread.
     const run_inline = [_][]const u8{
-        "crashHandler",            "now",                  "clockResolution",
-        "random",                  "randomSecure",         "lockStderr",
-        "tryLockStderr",           "unlockStderr",         "processExecutablePath",
-        "processCurrentPath",      "processSetCurrentDir", "processSetCurrentPath",
-        "processReplace",          "progressParentFile",   "inheritParentDir",
-        "inheritParentFile",       "fileClose",            "dirClose",
-        "netClose",                "netShutdown",          "childKill",            "fileMemoryMapDestroy",
-        "netInterfaceName",        "netInterfaceNameResolve",
-        "fileIsTty",               "fileSupportsAnsiEscapeCodes",
-        "fileEnableAnsiEscapeCodes",
+        "crashHandler",         "now",                         "clockResolution",
+        "random",               "randomSecure",                "lockStderr",
+        "tryLockStderr",        "unlockStderr",                "processExecutablePath",
+        "processCurrentPath",   "processSetCurrentDir",        "processSetCurrentPath",
+        "processReplace",       "progressParentFile",          "inheritParentDir",
+        "inheritParentFile",    "fileClose",                   "dirClose",
+        "netClose",             "netShutdown",                 "childKill",
+        "fileMemoryMapDestroy", "netInterfaceName",            "netInterfaceNameResolve",
+        "fileIsTty",            "fileSupportsAnsiEscapeCodes", "fileEnableAnsiEscapeCodes",
     };
 
     fn runsInline(comptime name: []const u8) bool {

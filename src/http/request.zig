@@ -3,12 +3,12 @@ const print = std.debug.print;
 const StringHashMap = std.StringHashMap;
 const mem = std.mem;
 const ascii = std.ascii;
-const StringMapPool = @import("constants.zig").StringMapPool;
+const StringMapPool = @import("../constants.zig").StringMapPool;
 const testing = std.testing;
-const supported_versions = @import("constants.zig").supported_versions;
+const supported_versions = @import("../constants.zig").supported_versions;
 const HttpError = @import("http_error.zig").HttpError;
 const http_header = @import("header.zig");
-const Params = @import("router.zig").Params;
+const Params = @import("../router.zig").Params;
 
 pub fn GenericRequest(comptime RequestContext: type) type {
     return struct {
