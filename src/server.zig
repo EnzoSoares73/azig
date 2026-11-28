@@ -10,12 +10,11 @@ const GenericAction = @import("action.zig").GenericAction;
 const suggested_buffer_size = @import("constants.zig").suggested_buffer_size;
 const Callback = @import("constants.zig").Callback;
 const read_chunk_size = @import("constants.zig").read_chunk_size;
-const ResponsePool = @import("constants.zig").ResponsePool;
 const ClientPool = @import("constants.zig").ClientPool;
 const WriteReqPool = @import("constants.zig").WriteReqPool;
-const ArenaPool = @import("constants.zig").ArenaPool;
 const Middleware = @import("constants.zig").Middleware;
-const StringMapPool = @import("constants.zig").StringMapPool;
+const ReusePool = @import("pools/reuse_pool.zig").ReusePool;
+const Fields = @import("http/fields.zig").Fields;
 const errorToStatusCode = @import("http/http_error.zig").errorToStatusCode;
 const HttpError = @import("http/http_error.zig").HttpError;
 const toHttpError = @import("http/http_error.zig").toHttpError;
@@ -42,7 +41,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
     // Requests are created and released on the loop's own context only (the handler task uses
     // a request, but never creates or destroys one).
-    const RequestPool = std.heap.MemoryPool(Request);
+    const RequestPool = ReusePool(Request);
+    const ResponsePool = ReusePool(Response);
 
     const Phase = enum {
         reading,
@@ -117,9 +117,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
         response_allocator: *ResponsePool,
         client_allocator: *ClientPool,
         write_req_allocator: *WriteReqPool,
-        arena_allocator: *ArenaPool,
         state_allocator: *StatePool,
-        map_allocator: *StringMapPool,
         app_context: *AppContext,
         routes: Router.Table,
         lio: *Libuv,
@@ -483,7 +481,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 // E.g. a handler set a header containing CR/LF. Send a plain 500 instead, without
                 // the headers: the invalid one would make serialization fail again.
                 logger.err("Failed to serialize response: {}", .{err});
-                response.*.headers.clearRetainingCapacity();
+                response.*.headers.clear();
                 response.*.setResponseError(500);
                 response.*.serializeInto(allocator, &state.*.write_buf) catch {
                     closeConnection(state);
@@ -653,18 +651,14 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 request.*.body = transferBufferSlice(old_buffer, @constCast(body), new_buffer);
             }
 
-            transferMap(request.headers, old_buffer, new_buffer);
-            transferMap(request.params, old_buffer, new_buffer);
+            transferFields(&request.headers, old_buffer, new_buffer);
+            transferFields(&request.query_params, old_buffer, new_buffer);
         }
 
-        fn transferMap(map: *std.StringHashMap([]const u8), old_buffer: []u8, new_buffer: []u8) void {
-            var iter = map.iterator();
-            while (iter.next()) |entry| {
-                const value = entry.value_ptr.*;
-                entry.value_ptr.* = transferBufferSlice(old_buffer, @constCast(value), new_buffer);
-
-                const key = entry.key_ptr.*;
-                entry.key_ptr.* = transferBufferSlice(old_buffer, @constCast(key), new_buffer);
+        fn transferFields(fields: *Fields, old_buffer: []u8, new_buffer: []u8) void {
+            for (fields.list.items) |*field| {
+                field.name = transferBufferSlice(old_buffer, @constCast(field.name), new_buffer);
+                field.value = transferBufferSlice(old_buffer, @constCast(field.value), new_buffer);
             }
         }
 
@@ -750,7 +744,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     return .failed;
                 }
 
-                const request = startRequest(ctx.*.allocator, ctx.*.map_allocator, ctx.*.request_allocator) catch |err| {
+                const request = ctx.*.request_allocator.acquire() catch |err| {
                     logger.err("There was an error initializing the request: {}", .{err});
                     closeConnection(state);
                     return .failed;
@@ -880,48 +874,12 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             startReading(state);
         }
 
-        fn startRequest(allocator: mem.Allocator, map_pool: *StringMapPool, request_pool: *RequestPool) !*Request {
-            const request = try request_pool.create(allocator);
-            errdefer request_pool.destroy(request);
-            request.* = try Request.init(map_pool);
-            return request;
-        }
-
-        fn startResponse(allocator: mem.Allocator, arena: *std.heap.ArenaAllocator, map_pool: *StringMapPool, response_pool: *ResponsePool) !*Response {
-            const response = try response_pool.create(allocator);
-            errdefer response_pool.destroy(response);
-            response.* = try Response.init(arena, map_pool);
-            return response;
-        }
-
         fn createResponse(ctx: *Context) !*Response {
-            const response_pool = ctx.*.response_allocator;
-            const map_pool = ctx.*.map_allocator;
-            const arena_pool = ctx.*.arena_allocator;
-            const allocator = ctx.*.allocator;
-
-            const arena = arena_pool.create(allocator) catch {
-                logger.err("There was an error initializing the arena", .{});
-                return error.ArenaInitFailed;
-            };
-            arena.* = std.heap.ArenaAllocator.init(allocator);
-            errdefer {
-                arena.deinit();
-                arena_pool.destroy(arena);
-            }
-
-            return startResponse(allocator, arena, map_pool, response_pool) catch {
-                logger.err("There was an error initializing the response", .{});
-                return error.ResponseInitFailed;
-            };
+            return ctx.*.response_allocator.acquire();
         }
 
         fn destroyResponse(ctx: *Context, response: *Response) void {
-            const arena = response.*.arena;
-            response.*.deinit(ctx.*.map_allocator);
-            ctx.*.response_allocator.destroy(response);
-            arena.deinit();
-            ctx.*.arena_allocator.destroy(arena);
+            ctx.*.response_allocator.release(response);
         }
 
         /// Releases the parsed request (if any). Its bytes stay in the read buffer.
@@ -929,8 +887,7 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             const ctx: *Context = @ptrCast(@alignCast(state.*.context));
 
             if (state.*.request) |request| {
-                request.*.deinit(ctx.*.map_allocator);
-                ctx.*.request_allocator.destroy(request);
+                ctx.*.request_allocator.release(request);
                 state.*.request = null;
             }
             state.*.head_len = 0;
@@ -1197,10 +1154,10 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
 
         fn initPools(allocator: mem.Allocator, ctx: *Context, pool_size: u16) !*const fn (allocator: mem.Allocator, ctx: *Context) void {
             ctx.*.request_allocator = try allocator.create(RequestPool);
-            ctx.*.request_allocator.* = try RequestPool.initCapacity(allocator, pool_size);
+            ctx.*.request_allocator.* = try RequestPool.initPreheated(allocator, pool_size);
 
             ctx.*.response_allocator = try allocator.create(ResponsePool);
-            ctx.*.response_allocator.* = try ResponsePool.initCapacity(allocator, pool_size);
+            ctx.*.response_allocator.* = try ResponsePool.initPreheated(allocator, pool_size);
 
             ctx.*.client_allocator = try allocator.create(ClientPool);
             ctx.*.client_allocator.* = try ClientPool.initCapacity(allocator, pool_size);
@@ -1208,23 +1165,15 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
             ctx.*.write_req_allocator = try allocator.create(WriteReqPool);
             ctx.*.write_req_allocator.* = try WriteReqPool.initCapacity(allocator, pool_size);
 
-            ctx.*.arena_allocator = try allocator.create(ArenaPool);
-            ctx.*.arena_allocator.* = try ArenaPool.initCapacity(allocator, pool_size);
-
             ctx.*.state_allocator = try allocator.create(StatePool);
             ctx.*.state_allocator.* = try StatePool.initCapacity(allocator, pool_size);
 
-            //The poolsize is multiplied by three because it is used by the
-            // request headers, the request params and the response headers
-            ctx.*.map_allocator = try allocator.create(StringMapPool);
-            ctx.*.map_allocator.* = try StringMapPool.initPreheated(allocator, pool_size * 3);
-
             return struct {
                 fn clean(allocator_inner: mem.Allocator, ctx_inner: *Context) void {
-                    ctx_inner.*.request_allocator.deinit(allocator_inner);
+                    ctx_inner.*.request_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.request_allocator);
 
-                    ctx_inner.*.response_allocator.deinit(allocator_inner);
+                    ctx_inner.*.response_allocator.deinit();
                     allocator_inner.destroy(ctx_inner.*.response_allocator);
 
                     ctx_inner.*.client_allocator.deinit(allocator_inner);
@@ -1233,14 +1182,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                     ctx_inner.*.write_req_allocator.deinit(allocator_inner);
                     allocator_inner.destroy(ctx_inner.*.write_req_allocator);
 
-                    ctx_inner.*.arena_allocator.deinit(allocator_inner);
-                    allocator_inner.destroy(ctx_inner.*.arena_allocator);
-
                     ctx_inner.*.state_allocator.deinit(allocator_inner);
                     allocator_inner.destroy(ctx_inner.*.state_allocator);
-
-                    ctx_inner.*.map_allocator.deinit();
-                    allocator_inner.destroy(ctx_inner.*.map_allocator);
                 }
             }.clean;
         }
@@ -2479,4 +2422,34 @@ test "stop called before start makes start return in acceptor mode" {
     defer server.deinit();
     server.stop();
     try server.start();
+}
+
+fn headerPerPath(_: std.Io, request: *GenericRequest(void), response: *Response) !void {
+    if (mem.eql(u8, request.path, "/first")) try response.addHeader("X-First", "yes");
+    response.body = try response.arena.allocator().dupe(u8, request.path);
+}
+
+test "a reused request and response carry nothing over to the next request" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0, .num_workers = 0, .pool_size = 1 }, .{ .handlers = &.{.any("", headerPerPath)} }, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, "GET /first?a=1 HTTP/1.1\r\nHost: localhost\r\nX-Only-First: 1\r\n\r\n" ++
+        "GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    const received = try raw_client.receiveAll(stream, allocator);
+    defer allocator.free(received);
+
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nX-First: yes\r\nContent-Length: 6\r\n\r\n/first" ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n/second", received);
 }

@@ -3,21 +3,34 @@ const Middleware = @import("constants.zig").Middleware;
 const Callback = @import("constants.zig").Callback;
 const Response = @import("http/response.zig").Response;
 const GenericRequest = @import("http/request.zig").GenericRequest;
+const Field = @import("http/fields.zig").Field;
+const ValueIterator = @import("http/fields.zig").ValueIterator;
 
 /// Maximum number of `:param` segments a single route may capture.
 pub const max_params = 8;
 
 /// Path parameters captured by `match`. Values are slices into the matched path.
 pub const Params = struct {
-    names: [max_params][]const u8 = undefined,
-    values: [max_params][]const u8 = undefined,
+    fields: [max_params]Field = undefined,
     len: usize = 0,
 
     pub fn get(self: *const Params, name: []const u8) ?[]const u8 {
-        for (self.names[0..self.len], self.values[0..self.len]) |n, v| {
-            if (std.mem.eql(u8, n, name)) return v;
+        for (self.items()) |field| {
+            if (std.mem.eql(u8, field.name, name)) return field.value;
         }
         return null;
+    }
+
+    pub fn getAll(self: *const Params, name: []const u8) ValueIterator {
+        return .{ .items = self.items(), .name = name };
+    }
+
+    pub fn count(self: *const Params) usize {
+        return self.len;
+    }
+
+    pub fn items(self: *const Params) []const Field {
+        return self.fields[0..self.len];
     }
 };
 
@@ -171,8 +184,7 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
                             cur = next;
                         } else if (n.param) |p| {
                             // Cannot overflow: param depth is checked against max_params at comptime.
-                            params.names[params.len] = p.name;
-                            params.values[params.len] = seg;
+                            params.fields[params.len] = .{ .name = p.name, .value = seg };
                             params.len += 1;
                             cur = p.child;
                         } else return .{ null, middlewares };
@@ -533,10 +545,15 @@ test "router: params are captured" {
     var params: Params = .{};
     const entry = try TestCompiled.match(.GET, "/api/v1/users/42/posts/7", &params);
     try testing.expectEqual(cb(5), entry.handler.callback);
-    try testing.expectEqual(@as(usize, 2), params.len);
+    try testing.expectEqual(@as(usize, 2), params.count());
     try testing.expectEqualStrings("42", params.get("id").?);
     try testing.expectEqualStrings("7", params.get("post").?);
     try testing.expectEqual(@as(?[]const u8, null), params.get("missing"));
+    try testing.expectEqualStrings("id", params.items()[0].name);
+    try testing.expectEqualStrings("post", params.items()[1].name);
+    var ids = params.getAll("id");
+    try testing.expectEqualStrings("42", ids.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), ids.next());
 
     _ = try expectHandler("/api/v1/users/42", 4);
 }
@@ -580,7 +597,7 @@ test "router: a miss runs the middlewares of the deepest router the path is unde
 test "router: params are cleared when nothing is found" {
     var params: Params = .{};
     try testing.expectError(error.NotFound, TestCompiled.match(.GET, "/api/v1/users/42/nope", &params));
-    try testing.expectEqual(@as(usize, 0), params.len);
+    try testing.expectEqual(@as(usize, 0), params.count());
     try testing.expectError(error.MethodNotAllowed, TestCompiled.match(.POST, "/api/v1/users/42", &params));
     try testing.expectEqualStrings("42", params.get("id").?);
 }

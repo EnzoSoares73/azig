@@ -1,9 +1,9 @@
 const std = @import("std");
 const print = std.debug.print;
-const StringHashMap = std.StringHashMap;
 const mem = std.mem;
 const ascii = std.ascii;
-const StringMapPool = @import("../constants.zig").StringMapPool;
+const Fields = @import("fields.zig").Fields;
+const ValueIterator = @import("fields.zig").ValueIterator;
 const testing = std.testing;
 const supported_versions = @import("../constants.zig").supported_versions;
 const HttpError = @import("http_error.zig").HttpError;
@@ -15,24 +15,19 @@ pub fn GenericRequest(comptime RequestContext: type) type {
         method: []const u8,
         path: []const u8,
         version: []const u8,
-        headers: *StringHashMap([]const u8),
-        params: *StringHashMap([]const u8),
-        /// `:name` segments captured by the router for the matched route.
+        headers: Fields,
+        query_params: Fields,
         path_params: Params,
         body: ?[]const u8,
         context: RequestContext,
 
         const Self = @This();
 
-        pub fn init(map_pool: *StringMapPool) !Self {
-            const headers = try map_pool.*.create();
-            errdefer map_pool.*.destroy(headers);
-            const params = try map_pool.*.create();
-
+        pub fn init(allocator: mem.Allocator) Self {
             return Self{
                 .body = null,
-                .headers = headers,
-                .params = params,
+                .headers = Fields.init(allocator),
+                .query_params = Fields.init(allocator),
                 .path_params = .{},
                 .method = undefined,
                 .path = undefined,
@@ -41,20 +36,28 @@ pub fn GenericRequest(comptime RequestContext: type) type {
             };
         }
 
-        pub fn deinit(self: *Self, map_pool: *StringMapPool) void {
-            map_pool.*.destroy(self.*.headers);
-            map_pool.*.destroy(self.*.params);
+        pub fn reset(self: *Self) void {
+            self.headers.reset();
+            self.query_params.reset();
+            self.body = null;
+            self.path_params = .{};
+            self.method = undefined;
+            self.path = undefined;
+            self.version = undefined;
+            self.context = undefined;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.headers.deinit();
+            self.query_params.deinit();
             self.* = undefined;
         }
 
         pub fn printSelf(self: Self) void {
             print("{s} {s} {s}\n", .{ self.method, self.path, self.version });
 
-            var iter = self.headers.*.iterator();
-            while (iter.next()) |entry| {
-                const key = entry.key_ptr.*;
-                const value = entry.value_ptr.*;
-                print("{s}: {s}\n", .{ key, value });
+            for (self.headers.items()) |field| {
+                print("{s}: {s}\n", .{ field.name, field.value });
             }
 
             if (self.body) |body| {
@@ -64,8 +67,15 @@ pub fn GenericRequest(comptime RequestContext: type) type {
             print("\n\n", .{});
         }
 
-        pub fn getHeader(self: Self, name: []const u8) ?[]const u8 {
-            return self.headers.*.get(@constCast(name));
+        /// The first value of a header. `name` must be canonical (`Content-Length`, not
+        /// `content-length`): the parser stores names that way.
+        pub fn getHeader(self: *const Self, name: []const u8) ?[]const u8 {
+            return self.headers.get(name);
+        }
+
+        /// Every value of a header, in order. `name` must be canonical, as in `getHeader`.
+        pub fn getHeaders(self: *const Self, name: []const u8) ValueIterator {
+            return self.headers.getAll(name);
         }
 
         /// Decodes a chunked body in place. `self.body` must hold exactly one complete chunked
@@ -226,9 +236,9 @@ pub fn GenericRequest(comptime RequestContext: type) type {
                     if (std.mem.indexOf(u8, param, "=")) |equals_pos| {
                         const name = param[0..equals_pos];
                         const value = param[equals_pos + 1 ..];
-                        try self.*.params.*.put(name, value);
+                        try self.query_params.append(name, value);
                     } else if (param.len > 0) {
-                        try self.*.params.*.put(param, "");
+                        try self.query_params.append(param, "");
                     }
                 }
             }
@@ -269,17 +279,12 @@ pub fn GenericRequest(comptime RequestContext: type) type {
 
                 capitalizeHeaderName(@constCast(key));
 
-                const entry = try self.*.headers.*.getOrPut(key);
-                if (entry.found_existing) {
-                    // These decide how the request is routed and framed, so a repeated value is
-                    // ambiguous (and a request smuggling vector). Other repeated headers keep the
-                    // last value.
-                    if (isSingletonHeader(key)) {
-                        return HttpError.BadRequest;
-                    }
+                // These decide how the request is routed and framed, so a repeated value is
+                // ambiguous (and a request smuggling vector).
+                if (isSingletonHeader(key) and self.headers.get(key) != null) {
+                    return HttpError.BadRequest;
                 }
-                entry.key_ptr.* = key;
-                entry.value_ptr.* = value;
+                try self.headers.append(key, value);
 
                 if (std.mem.eql(u8, key, "Host")) {
                     has_host_header = isValidHost(value);
@@ -388,13 +393,11 @@ test "Request initialization and cleanup" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     try testing.expect(request.body == null);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "parse simple GET request" {
@@ -402,9 +405,7 @@ test "parse simple GET request" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     const request_raw: []const u8 =
         "GET /index.html HTTP/1.1\r\n" ++
@@ -424,7 +425,7 @@ test "parse simple GET request" {
     try testing.expectEqualStrings("example.com", request.getHeader("Host").?);
     try testing.expectEqualStrings("test-agent", request.getHeader("User-Agent").?);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "parse POST request with body" {
@@ -432,9 +433,7 @@ test "parse POST request with body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -456,7 +455,7 @@ test "parse POST request with body" {
     try testing.expectEqualStrings("application/json", request.getHeader("Content-Type").?);
     try testing.expectEqualStrings("18", request.getHeader("Content-Length").?);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "header name capitalization" {
@@ -464,9 +463,7 @@ test "header name capitalization" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -484,7 +481,7 @@ test "header name capitalization" {
     try testing.expect(request.getHeader("User-Agent") != null);
     try testing.expect(request.getHeader("X-Custom-Header") != null);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "invalid request format" {
@@ -492,9 +489,7 @@ test "invalid request format" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     try testing.expectError(HttpError.BadRequest, request.parseRequest(@constCast("GET HTTP/1.1\r\n\r\n"), test_allowed_methods));
 
@@ -502,7 +497,7 @@ test "invalid request format" {
 
     try testing.expectError(HttpError.BadRequest, request.parseRequest(@constCast("GET /path HTTP/1.1\r\ninvalidheader\r\n\r\n"), test_allowed_methods));
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "request with multiple headers" {
@@ -510,9 +505,7 @@ test "request with multiple headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -526,13 +519,13 @@ test "request with multiple headers" {
     defer allocator.free(mutable_request);
     try request.parseRequest(mutable_request, test_allowed_methods);
 
-    try testing.expectEqual(@as(usize, 4), request.headers.*.count());
+    try testing.expectEqual(@as(usize, 4), request.headers.count());
     try testing.expectEqualStrings("example.com", request.getHeader("Host").?);
     try testing.expectEqualStrings("text/html", request.getHeader("Accept").?);
     try testing.expectEqualStrings("en-US", request.getHeader("Accept-Language").?);
     try testing.expectEqualStrings("keep-alive", request.getHeader("Connection").?);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "request with empty headers" {
@@ -540,9 +533,7 @@ test "request with empty headers" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -554,10 +545,10 @@ test "request with empty headers" {
     defer allocator.free(mutable_request);
     try request.parseRequest(mutable_request, test_allowed_methods);
 
-    try testing.expectEqual(@as(usize, 2), request.headers.*.count());
+    try testing.expectEqual(@as(usize, 2), request.headers.count());
     try testing.expectEqualStrings("", request.getHeader("Empty-Header").?);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "request with query parameters" {
@@ -565,9 +556,7 @@ test "request with query parameters" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
+    var request = GenericRequest(void).init(allocator);
 
     const request_raw =
         "GET /path?param1=value1&param2=value2&flag HTTP/1.1\r\n" ++
@@ -580,12 +569,12 @@ test "request with query parameters" {
 
     try testing.expectEqualStrings("/path", request.path);
 
-    try testing.expectEqual(@as(usize, 3), request.params.*.count());
-    try testing.expectEqualStrings("value1", request.params.*.get("param1").?);
-    try testing.expectEqualStrings("value2", request.params.*.get("param2").?);
-    try testing.expectEqualStrings("", request.params.*.get("flag").?);
+    try testing.expectEqual(@as(usize, 3), request.query_params.count());
+    try testing.expectEqualStrings("value1", request.query_params.get("param1").?);
+    try testing.expectEqualStrings("value2", request.query_params.get("param2").?);
+    try testing.expectEqualStrings("", request.query_params.get("flag").?);
 
-    request.deinit(&map_pool);
+    request.deinit();
 }
 
 test "test basic chunked body parsing" {
@@ -593,10 +582,8 @@ test "test basic chunked body parsing" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -626,10 +613,8 @@ test "test with empty chunk in the middle" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -657,10 +642,8 @@ test "test with decimal chunk size" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -686,10 +669,8 @@ test "test with missing terminating chunk" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -713,10 +694,8 @@ test "test with invalid chunk size" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -740,10 +719,8 @@ test "test with chunk size too large (would go beyond end of body)" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -767,10 +744,8 @@ test "test with missing CRLF after chunk data" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -794,10 +769,8 @@ test "test with content after final chunk" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "POST /submit HTTP/1.1\r\n" ++
@@ -823,10 +796,8 @@ fn testBodyLength(head: []const u8, data: []const u8) !?usize {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const mutable_head = try allocator.dupe(u8, head);
     try request.parseRequest(mutable_head, test_allowed_methods);
@@ -955,10 +926,8 @@ fn testParse(raw: []const u8) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     try request.parseRequest(try allocator.dupe(u8, raw), test_allowed_methods);
 }
@@ -969,21 +938,24 @@ test "parseRequest rejects duplicated framing and routing headers" {
     try testing.expectError(HttpError.BadRequest, testParse("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\ntransfer-encoding: chunked\r\n\r\n"));
 }
 
-test "parseRequest keeps the last value of other repeated headers" {
+test "parseRequest keeps every value of other repeated headers, in order" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const raw = "GET / HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\naccept: application/json\r\n\r\n";
     try request.parseRequest(try allocator.dupe(u8, raw), test_allowed_methods);
 
-    try testing.expectEqual(@as(usize, 2), request.headers.*.count());
-    try testing.expectEqualStrings("application/json", request.getHeader("Accept").?);
+    try testing.expectEqual(@as(usize, 3), request.headers.count());
+    try testing.expectEqualStrings("text/html", request.getHeader("Accept").?);
+    try testing.expectEqual(@as(?[]const u8, null), request.getHeader("accept"));
+    var values = request.getHeaders("Accept");
+    try testing.expectEqualStrings("text/html", values.next().?);
+    try testing.expectEqualStrings("application/json", values.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), values.next());
 }
 
 test "parseRequest rejects invalid header names and line endings" {
@@ -1000,10 +972,8 @@ test "isKeepAlive with keep-alive header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1023,10 +993,8 @@ test "isKeepAlive with close header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1046,10 +1014,8 @@ test "isKeepAlive with no Connection header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1068,10 +1034,8 @@ test "isKeepAlive with mixed case Connection header" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1091,10 +1055,8 @@ test "host validation with valid IP address" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1111,10 +1073,8 @@ test "host validation with valid IP address and port" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1131,10 +1091,8 @@ test "host validation with valid domain name" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1151,10 +1109,8 @@ test "host validation with valid domain name and subdomain" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1171,10 +1127,8 @@ test "host validation with valid domain name and port" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1191,10 +1145,8 @@ test "host validation with domain containing hyphens" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1211,10 +1163,8 @@ test "host validation with invalid domain starting with hyphen" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1231,10 +1181,8 @@ test "host validation with invalid domain ending with hyphen" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1251,10 +1199,8 @@ test "host validation with invalid domain containing invalid character" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1271,10 +1217,8 @@ test "host validation with empty host" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "GET / HTTP/1.1\r\n" ++
@@ -1291,10 +1235,8 @@ test "validate method function with invalid method" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var request = try GenericRequest(void).init(&map_pool);
-    defer request.deinit(&map_pool);
+    var request = GenericRequest(void).init(allocator);
+    defer request.deinit();
 
     const request_raw =
         "INVALID / HTTP/1.1\r\n" ++

@@ -1,17 +1,17 @@
 const std = @import("std");
 const print = std.debug.print;
-const StringHashMap = std.StringHashMap;
 const mem = std.mem;
-const StringMapPool = @import("../constants.zig").StringMapPool;
+const Fields = @import("fields.zig").Fields;
 const testing = std.testing;
 const statusCodeToMessage = @import("http_error.zig").statusCodeToMessage;
 const http_header = @import("header.zig");
 
 pub const Response = struct {
     status_code: u16,
-    headers: *StringHashMap([]const u8),
+    headers: Fields,
     body: ?[]const u8,
-    arena: *std.heap.ArenaAllocator,
+    /// Freed when the response is done; a reused response keeps up to `retained_arena_bytes`.
+    arena: std.heap.ArenaAllocator,
     /// When false, the body is left out but Content-Length still reflects it (HEAD responses).
     send_body: bool,
 
@@ -19,29 +19,51 @@ pub const Response = struct {
 
     pub const Error = error{InvalidHeader};
 
-    pub fn init(arena: *std.heap.ArenaAllocator, map_pool: *StringMapPool) !Self {
-        const map = try map_pool.*.create();
+    const retained_arena_bytes = 64 * 1024;
+
+    pub fn init(allocator: mem.Allocator) Self {
         return Self{
             .body = null,
-            .headers = map,
+            .headers = Fields.init(allocator),
             .status_code = 200,
-            .arena = arena,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .send_body = true,
         };
     }
 
-    pub fn deinit(self: *Self, map_pool: *StringMapPool) void {
-        map_pool.*.destroy(self.*.headers);
+    /// Prepares the response for the next request, keeping some of its memory.
+    pub fn reset(self: *Self) void {
+        self.headers.reset();
+        _ = self.arena.reset(.{ .retain_with_limit = retained_arena_bytes });
+        self.body = null;
+        self.status_code = 200;
+        self.send_body = true;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.headers.deinit();
+        self.arena.deinit();
         self.* = undefined;
     }
 
     /// Returns error.InvalidHeader if the name is not a valid token or the value contains
-    /// CR, LF or NUL, which would allow header injection.
+    /// CR, LF or NUL, which would allow header injection. Repeated names are all sent
+    /// (e.g. several `Set-Cookie`); use `setHeader` to replace a value.
     pub fn addHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try validateHeader(name, value);
+        try self.headers.append(name, value);
+    }
+
+    /// Like `addHeader`, but replaces every previous value of `name`.
+    pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try validateHeader(name, value);
+        try self.headers.put(name, value);
+    }
+
+    fn validateHeader(name: []const u8, value: []const u8) Error!void {
         if (!http_header.isValidName(name) or !http_header.isValidValue(value)) {
             return Error.InvalidHeader;
         }
-        try self.*.headers.*.put(name, value);
     }
 
     /// Serializes the response into a newly allocated buffer owned by the caller.
@@ -80,15 +102,12 @@ pub const Response = struct {
         size += status_text.len;
         size += "\r\n".len;
 
-        var headers_iter = self.headers.*.iterator();
-        while (headers_iter.next()) |entry| {
-            // Checked here too, since handlers can also write to the headers map directly.
-            if (!http_header.isValidName(entry.key_ptr.*) or !http_header.isValidValue(entry.value_ptr.*)) {
-                return Error.InvalidHeader;
-            }
-            size += entry.key_ptr.len;
+        for (self.headers.items()) |field| {
+            // Checked here too, since handlers can also write to the headers directly.
+            try validateHeader(field.name, field.value);
+            size += field.name.len;
             size += ": ".len;
-            size += entry.value_ptr.len;
+            size += field.value.len;
             size += "\r\n".len;
         }
 
@@ -116,9 +135,8 @@ pub const Response = struct {
             statusCodeToMessage(self.status_code) orelse "Unknown",
         });
 
-        var headers_iter = self.headers.*.iterator();
-        while (headers_iter.next()) |entry| {
-            try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        for (self.headers.items()) |field| {
+            try writer.print("{s}: {s}\r\n", .{ field.name, field.value });
         }
 
         const len = if (self.body) |b| b.len else 0;
@@ -144,15 +162,13 @@ test "Response initialization and cleanup" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     try testing.expectEqual(@as(u16, 200), response.status_code);
     try testing.expectEqual(@as(?[]const u8, null), response.body);
     try testing.expectEqual(@as(usize, 0), response.headers.count());
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response addHeader" {
@@ -160,9 +176,7 @@ test "Response addHeader" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     try response.addHeader("Content-Type", "application/json");
     try response.addHeader("X-Custom-Header", "test-value");
@@ -171,7 +185,7 @@ test "Response addHeader" {
     try testing.expectEqualStrings("application/json", response.headers.get("Content-Type").?);
     try testing.expectEqualStrings("test-value", response.headers.get("X-Custom-Header").?);
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response toString with small response" {
@@ -179,9 +193,7 @@ test "Response toString with small response" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     try response.addHeader("Content-Type", "text/plain");
     response.body = "Hello, World!";
@@ -194,7 +206,7 @@ test "Response toString with small response" {
     try testing.expect(mem.indexOf(u8, response_str, "Content-Length: 13\r\n") != null);
     try testing.expect(mem.endsWith(u8, response_str, "\r\n\r\nHello, World!"));
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response toString with large response" {
@@ -202,9 +214,7 @@ test "Response toString with large response" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     const body_size = 5000;
     const large_body = try allocator.alloc(u8, body_size);
@@ -219,7 +229,7 @@ test "Response toString with large response" {
     try testing.expect(mem.indexOf(u8, response_str, "Content-Length: 5000\r\n") != null);
     try testing.expect(mem.indexOf(u8, response_str, "\r\n\r\n").? + 4 + body_size == response_str.len);
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response status code strings" {
@@ -227,9 +237,7 @@ test "Response status code strings" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     // Test known status codes
     response.status_code = 200;
@@ -248,7 +256,7 @@ test "Response status code strings" {
     defer allocator.free(unknown_str);
     try testing.expect(mem.startsWith(u8, unknown_str, "HTTP/1.1 999 Unknown\r\n"));
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response with no body" {
@@ -256,9 +264,7 @@ test "Response with no body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
     try response.addHeader("X-Empty", "true");
     response.body = null;
 
@@ -270,7 +276,7 @@ test "Response with no body" {
     try testing.expect(mem.indexOf(u8, response_str, "Content-Length: 0\r\n") != null);
     try testing.expect(mem.endsWith(u8, response_str, "\r\n\r\n"));
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response calculateSerializedSize" {
@@ -278,9 +284,7 @@ test "Response calculateSerializedSize" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     try response.addHeader("Content-Type", "text/html");
     response.body = "<html></html>";
@@ -295,7 +299,7 @@ test "Response calculateSerializedSize" {
 
     try testing.expectEqual(expected_size, size);
 
-    response.deinit(&map_pool);
+    response.deinit();
 }
 
 test "Response without send_body keeps Content-Length but omits the body (HEAD)" {
@@ -303,10 +307,8 @@ test "Response without send_body keeps Content-Length but omits the body (HEAD)"
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
-    defer response.deinit(&map_pool);
+    var response = Response.init(allocator);
+    defer response.deinit();
 
     response.body = "Hello, World!";
     response.send_body = false;
@@ -324,10 +326,8 @@ test "Response addHeader rejects header injection" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
-    defer response.deinit(&map_pool);
+    var response = Response.init(allocator);
+    defer response.deinit();
 
     try testing.expectError(Response.Error.InvalidHeader, response.addHeader("X-Name", "value\r\nSet-Cookie: session=evil"));
     try testing.expectError(Response.Error.InvalidHeader, response.addHeader("X-Name\r\nSet-Cookie", "evil"));
@@ -340,10 +340,8 @@ test "Response toString rejects invalid headers written to the map directly" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
-    defer response.deinit(&map_pool);
+    var response = Response.init(allocator);
+    defer response.deinit();
 
     try response.headers.put("X-Name", "value\r\n\r\ninjected body");
     try testing.expectError(Response.Error.InvalidHeader, response.toString(allocator));
@@ -354,9 +352,7 @@ test "Response setResponseError keeps the headers and drops the body" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
     try response.addHeader("Access-Control-Allow-Origin", "*");
     response.body = "partial";
     response.setResponseError(404);
@@ -369,5 +365,34 @@ test "Response setResponseError keeps the headers and drops the body" {
     try testing.expect(mem.indexOf(u8, response_str, "Content-Length: 0\r\n") != null);
     try testing.expect(mem.endsWith(u8, response_str, "\r\n\r\n"));
 
-    response.deinit(&map_pool);
+    response.deinit();
+}
+
+test "Response sends every value of a repeated header" {
+    var response = Response.init(testing.allocator);
+    defer response.deinit();
+
+    try response.addHeader("Set-Cookie", "a=1");
+    try response.addHeader("Set-Cookie", "b=2");
+    const out = try response.toString(testing.allocator);
+    defer testing.allocator.free(out);
+
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\n\r\n", out);
+}
+
+test "Response reset clears everything set by the previous request" {
+    var response = Response.init(testing.allocator);
+    defer response.deinit();
+
+    try response.addHeader("X-Old", "1");
+    response.body = try response.arena.allocator().dupe(u8, "old body");
+    response.status_code = 404;
+    response.send_body = false;
+
+    response.reset();
+
+    try testing.expectEqual(@as(usize, 0), response.headers.count());
+    try testing.expectEqual(@as(?[]const u8, null), response.body);
+    try testing.expectEqual(@as(u16, 200), response.status_code);
+    try testing.expect(response.send_body);
 }

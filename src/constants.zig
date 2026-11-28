@@ -1,7 +1,6 @@
 const std = @import("std");
 const Response = @import("http/response.zig").Response;
 const uv = @import("uv");
-const MapPool = @import("pools/map_pool.zig").MapPool;
 const GenericRequest = @import("http/request.zig").GenericRequest;
 const GenericAction = @import("action.zig").GenericAction;
 
@@ -36,16 +35,8 @@ pub fn Middleware(comptime AppContext: type, comptime RequestContext: type) type
         return *const fn (*AppContext, std.Io, *Request, *Response, Action) anyerror!void;
 }
 
-pub const ResponsePool = std.heap.MemoryPool(Response);
-
 pub const ClientPool = std.heap.MemoryPool(uv.uv_tcp_t);
 
 pub const WriteReqPool = std.heap.MemoryPool(uv.uv_write_t);
-
-pub const ArenaPool = std.heap.MemoryPool(std.heap.ArenaAllocator);
-
-pub const StringMapPool = MapPool(.{
-    .growable = true,
-});
 
 pub const supported_versions = [_][]const u8{"HTTP/1.1"};

@@ -66,7 +66,7 @@ I/O, sleeping, synchronization and concurrency, with the usual `io.async` / `awa
 
 ```zig
 fn getUser(io: std.Io, request: *azig.Request, response: *azig.Response) !void {
-    const id = request.params.get("id") orelse return error.BadRequest;
+    const id = request.query_params.get("id") orelse return error.BadRequest;
 
     var user = io.async(db.fetchUser, .{ io, id });
     defer _ = user.cancel(io) catch {};
@@ -190,9 +190,13 @@ fn onResponse(_: std.Io, request: *azig.Request, _: *azig.Response) !void {
 }
 ```
 
-On the request side, `request.method`, `request.path`, `request.body`, `request.getHeader(name)`
-and the query parameters in `request.params` are available. Header names are normalized
-(`content-type` becomes `Content-Type`).
+`response.addHeader(name, value)` appends a header, so a name can be sent several times (e.g.
+`Set-Cookie`); `response.setHeader(name, value)` replaces every previous value.
+
+On the request side, `request.method`, `request.path`, `request.body`, `request.getHeader(name)`,
+`request.getHeaders(name)` (every value of a repeated header) and the query parameters in
+`request.query_params` are available. Header names are normalized (`content-type` becomes
+`Content-Type`), and lookups only match that canonical form: `getHeader("Content-Type")`.
 
 ## Stopping the server
 

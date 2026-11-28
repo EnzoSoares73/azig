@@ -51,7 +51,6 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
 }
 
 const testing = std.testing;
-const StringMapPool = @import("constants.zig").StringMapPool;
 const test_allowed_methods: *const [6][]const u8 = &.{ "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD" };
 
 test "GenericAction with void AppContext calls callback when no middlewares" {
@@ -62,12 +61,10 @@ test "GenericAction with void AppContext calls callback when no middlewares" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     const Request = GenericRequest(TestRequestContext);
-    var request = try Request.init(&map_pool);
+    var request = Request.init(allocator);
 
     const request_raw: []const u8 =
         "GET /index.html HTTP/1.1\r\n" ++
@@ -110,12 +107,10 @@ test "should return early if middleware does not call next()" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     const Request = GenericRequest(TestRequestContext);
-    var request = try Request.init(&map_pool);
+    var request = Request.init(allocator);
     request.context.counter = 0;
 
     const request_raw: []const u8 =
@@ -167,12 +162,10 @@ test "should call middlewares in order" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     const Request = GenericRequest(TestRequestContext);
-    var request = try Request.init(&map_pool);
+    var request = Request.init(allocator);
     request.context.counter = 0;
 
     const request_raw: []const u8 =
@@ -237,12 +230,10 @@ test "error raised by callback is captured" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map_pool = try StringMapPool.init(allocator);
-
-    var response = try Response.init(&arena, &map_pool);
+    var response = Response.init(allocator);
 
     const Request = GenericRequest(TestRequestContext);
-    var request = try Request.init(&map_pool);
+    var request = Request.init(allocator);
 
     const CallbackFn = Callback(AppContext, TestRequestContext);
     const callback: CallbackFn = struct {

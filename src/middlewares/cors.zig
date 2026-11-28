@@ -87,7 +87,7 @@ pub fn CorsMiddleware(
                 try response.addHeader("Access-Control-Allow-Headers", h);
             }
             if (max_age) |s| try response.addHeader("Access-Control-Max-Age", s);
-            if (preflight_vary) |v| try response.addHeader("Vary", v);
+            if (preflight_vary) |v| try response.setHeader("Vary", v);
         }
     };
 
@@ -103,7 +103,6 @@ pub fn CorsMiddleware(
 }
 
 const testing = std.testing;
-const StringMapPool = @import("../constants.zig").StringMapPool;
 const Callback = @import("../constants.zig").Callback;
 const test_allowed_methods: []const []const u8 = &.{ "GET", "PUT", "OPTIONS" };
 
@@ -112,7 +111,6 @@ const TestAction = GenericAction(void, void);
 
 const Harness = struct {
     arena: std.heap.ArenaAllocator,
-    map_pool: StringMapPool,
     request: TestRequest,
     response: Response,
     called: bool = false,
@@ -126,9 +124,8 @@ const Harness = struct {
     fn run(self: *Harness, middleware: Middleware(void, void), raw: []const u8, allow: []const u8) !void {
         self.arena = .init(testing.allocator);
         const allocator = self.arena.allocator();
-        self.map_pool = try StringMapPool.init(allocator);
-        self.response = try Response.init(&self.arena, &self.map_pool);
-        self.request = try TestRequest.init(&self.map_pool);
+        self.response = Response.init(allocator);
+        self.request = TestRequest.init(allocator);
         try self.request.parseRequest(try allocator.dupe(u8, raw), test_allowed_methods);
 
         handler_called = false;

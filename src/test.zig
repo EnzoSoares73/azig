@@ -5,7 +5,8 @@ test {
     _ = @import("http/response.zig");
     _ = @import("http/request.zig");
     _ = @import("action.zig");
-    _ = @import("pools/map_pool.zig");
+    _ = @import("pools/reuse_pool.zig");
+    _ = @import("http/fields.zig");
     _ = @import("http/header.zig");
     _ = @import("http/http_error.zig");
     _ = @import("pools/sync.zig");
