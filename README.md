@@ -141,6 +141,103 @@ fn getPost(_: std.Io, request: *azig.Request, response: *azig.Response) !void {
 * A root router without `routes`, whose handlers have no path (`.any("", onRequest)`), handles every path.
 * The router must be known at compile time.
 
+### Route config
+
+Routers and handlers take an optional `config` (`azig.RouteConfig`). A router's config covers every
+route below it; for each field, the value set closest to the handler wins:
+
+```zig
+const router: azig.Router = .{ .routes = &.{.{
+    .path = "/jobs",
+    .config = .{ .status = .accepted },
+    .handlers = &.{
+        .post("", enqueueJob), // 202
+        .{ .path = "/:id", .method = .PUT, .callback = replaceJob, .config = .{ .status = .ok } }, // 200
+    },
+}} };
+```
+
+| Field      | Default | Description                                                                                                             |
+|------------|---------|-------------------------------------------------------------------------------------------------------------------------|
+| `status`   | `200`   | Status the response starts with, before middlewares and the handler run; they may still change it. Must be 2xx or 3xx. |
+| `produces` | none    | Media types the route can send, most preferred first. See [Content negotiation](#content-negotiation).                  |
+| `consumes` | none    | Media ranges a request body may have. See [Content negotiation](#content-negotiation).                                  |
+
+### Content negotiation
+
+Content negotiation is how a client and a route agree on the format of what they exchange. The
+client says what it sends in `Content-Type` and what it wants back in `Accept`. The route declares
+what it handles in its config:
+
+| Config     | Checks the request's | Fails with | The handler finds the result in |
+|------------|----------------------|------------|---------------------------------|
+| `consumes` | `Content-Type`       | `415`      | `request.content_type`          |
+| `produces` | `Accept`             | `406`      | `response.content_type`         |
+
+Both run after the middlewares and right before the handler, `consumes` first. A failed check stops
+the request there, so the handler only runs when both sides agree. Like every config field, both
+are inherited by the routes below a router, and `&.{}` turns them off for a subtree.
+
+```zig
+const router: azig.Router = .{ .routes = &.{.{
+    .path = "/api",
+    .config = .{ .consumes = &.{"application/json"}, .produces = &.{ "application/json", "text/csv" } },
+    .handlers = &.{ .get("/orders", listOrders), .post("/orders", createOrder) },
+}} };
+```
+
+#### Response types (`produces`)
+
+With `produces`, the request's `Accept` header picks one of the types after the middlewares run
+and before the handler does. The handler finds it in `response.content_type`:
+
+```zig
+const router: azig.Router = .{
+    .config = .{ .produces = &.{ "application/json", "text/html" } },
+    .handlers = &.{.get("/report", report)},
+};
+
+fn report(_: std.Io, _: *azig.Request, response: *azig.Response) !void {
+    response.body = if (std.mem.eql(u8, response.content_type.?, "text/html")) "<h1>Report</h1>" else "{\"report\":1}";
+}
+```
+
+* Without `Accept`, the first type is chosen. Otherwise each type gets the q-value of the most
+  specific range that matches it (`text/html` > `text/*` > `*/*`), and the highest wins; ties
+  go to the order in `produces`. Parameters other than `q` are ignored.
+* If `Accept` allows none of the types, the response is a `406`. Middlewares run first, so for
+  example an unauthenticated client still gets `authenticate`'s `401`.
+* `response.content_type` is sent as `Content-Type` when the response has a body, unless the
+  handler sets a `Content-Type` header itself. Error responses have no body, so they never claim it.
+* With more than one type, `Vary: Accept` is added so caches keep the variants apart.
+* Entries must be concrete `type/subtype` values, without wildcards or parameters; this is checked at compile time.
+
+#### Request body types (`consumes`)
+
+With `consumes`, a request body's `Content-Type` must match one of the listed ranges before the
+handler runs. The handler finds the body's media type, without parameters, in `request.content_type`:
+
+```zig
+const router: azig.Router = .{
+    .config = .{ .consumes = &.{ "application/json", "image/*" } },
+    .handlers = &.{ .get("/files", listFiles), .post("/files", upload) },
+};
+
+fn upload(_: std.Io, request: *azig.Request, response: *azig.Response) !void {
+    // "application/json" for `Content-Type: application/json; charset=utf-8`, "image/png", ...
+    const kind = request.content_type.?;
+    ...
+}
+```
+
+* Ranges can be `type/subtype`, `type/*` or `*/*`, without parameters; this is checked at compile time.
+* Requests without a body (or with an empty one) are not checked, so `GET /files` passes.
+* A body whose type matches no range gets a `415`. A body without `Content-Type` counts as
+  `application/octet-stream`, so it gets a `415` too unless that type is accepted.
+* On a `415`, `POST` responses list the accepted ranges in `Accept-Post`, and `PATCH` responses in `Accept-Patch`.
+* A malformed `Content-Type`, or several different ones, gets a `400`.
+* Like `produces`, the check runs after the middlewares; when both fail, the `415` wins over the `406`.
+
 ## Configuration
 
 `Server.init` takes a `Config` (known at compile time); call `deinit` on the server once `start()` has returned. Every field has a default:

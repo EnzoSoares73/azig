@@ -6,6 +6,8 @@ pub fn Azig(comptime AppContext: type, comptime RequestContext: type) type {
         pub const Config = @import("config.zig").Config;
         pub const Action = @import("action.zig").GenericAction(AppContext, RequestContext);
         pub const Router = @import("router.zig").GenericRouter(AppContext, RequestContext);
+        /// Per-route settings for `Router` and `Router.Handler`.
+        pub const RouteConfig = @import("router.zig").RouteConfig;
         /// Errors that handlers and middlewares can return to send the matching status code.
         pub const HttpError = @import("http/http_error.zig").HttpError;
         pub const CorsOptions = @import("middlewares/cors.zig").CorsOptions;

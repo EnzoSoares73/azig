@@ -3,6 +3,7 @@ const Middleware = @import("constants.zig").Middleware;
 const Callback = @import("constants.zig").Callback;
 const Response = @import("http/response.zig").Response;
 const GenericRequest = @import("http/request.zig").GenericRequest;
+const negotiation = @import("http/negotiation.zig");
 const Field = @import("http/fields.zig").Field;
 const ValueIterator = @import("http/fields.zig").ValueIterator;
 
@@ -34,6 +35,68 @@ pub const Params = struct {
     }
 };
 
+/// Per-route settings
+pub const RouteConfig = struct {
+    /// The status a response starts with, before middlewares and the handler run. Defaults to 200.
+    status: ?std.http.Status = null,
+    /// Media types the handler can send ("application/json"), most preferred first.
+    produces: ?[]const []const u8 = null,
+    /// Media ranges a request body may have ("application/json", "image/*", "*/*"). A body
+    /// outside them, or without `Content-Type`, gets a 415; requests without a body pass.
+    consumes: ?[]const []const u8 = null,
+
+    pub fn merge(self: RouteConfig, over: RouteConfig) RouteConfig {
+        var out = self;
+        inline for (@typeInfo(RouteConfig).@"struct".field_names) |name| {
+            if (@field(over, name)) |v| @field(out, name) = v;
+        }
+        return out;
+    }
+};
+
+pub const ResolvedRouteConfig = struct {
+    status: std.http.Status = .ok,
+    /// Empty when there is nothing to negotiate.
+    produces: []const []const u8 = &.{},
+    /// Empty when request bodies are not checked.
+    consumes: []const []const u8 = &.{},
+    /// `consumes` joined with ", ", for `Accept-Post` / `Accept-Patch` on a 415.
+    consumes_header: []const u8 = "",
+
+    pub const default: ResolvedRouteConfig = .{};
+
+    fn resolve(comptime o: RouteConfig, comptime route: []const u8) ResolvedRouteConfig {
+        const status: std.http.Status = o.status orelse .ok;
+        const code = @intFromEnum(status);
+        if (code < 200 or code >= 400)
+            @compileError(std.fmt.comptimePrint("route {s}: default status {d} is not a 2xx or 3xx", .{ route, code }));
+        const produces = o.produces orelse &.{};
+        for (produces) |media_type| {
+            if (!negotiation.isConcreteMediaType(media_type))
+                @compileError("route " ++ route ++ ": \"" ++ media_type ++ "\" in produces is not a type/subtype without wildcards or parameters");
+        }
+        checkDuplicates(produces, route, "produces");
+        const consumes = o.consumes orelse &.{};
+        var consumes_header: []const u8 = "";
+        for (consumes) |range| {
+            if (!negotiation.isMediaRange(range))
+                @compileError("route " ++ route ++ ": \"" ++ range ++ "\" in consumes is not a type/subtype, type/* or */* without parameters");
+            consumes_header = consumes_header ++ (if (consumes_header.len == 0) "" else ", ") ++ range;
+        }
+        checkDuplicates(consumes, route, "consumes");
+        return .{ .status = status, .produces = produces, .consumes = consumes, .consumes_header = consumes_header };
+    }
+
+    fn checkDuplicates(comptime list: []const []const u8, comptime route: []const u8, comptime field: []const u8) void {
+        for (list, 0..) |item, i| {
+            for (list[0..i]) |prev| {
+                if (std.ascii.eqlIgnoreCase(prev, item))
+                    @compileError("route " ++ route ++ ": \"" ++ item ++ "\" appears twice in " ++ field);
+            }
+        }
+    }
+};
+
 pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) type {
     const MiddlewareFn = Middleware(AppContext, RequestContext);
     const CallbackFn = Callback(AppContext, RequestContext);
@@ -46,6 +109,8 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
         middlewares: []const MiddlewareFn = &.{},
         handlers: []const Handler = &.{},
         routes: []const Self = &.{},
+        /// Inherited by every handler and router below this one. See `RouteConfig`.
+        config: RouteConfig = .{},
 
         pub const Handler = struct {
             /// Relative to the router's path; "" is the router's path itself. Segments starting
@@ -56,6 +121,8 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
             callback: CallbackFn,
             /// Run after the routers' middlewares, for this handler only.
             middlewares: []const MiddlewareFn = &.{},
+            /// Overrides the routers' config for this handler only. See `RouteConfig`.
+            config: RouteConfig = .{},
 
             pub fn get(path: []const u8, callback: CallbackFn) Handler {
                 return .{ .path = path, .method = .GET, .callback = callback };
@@ -89,6 +156,8 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
             handler: Handler,
             middlewares: []const MiddlewareFn,
             allow: []const u8,
+            /// The config of every router from the root down, then the handler's, merged.
+            config: ResolvedRouteConfig = .{},
         };
 
         pub const MatchError = error{
@@ -324,7 +393,7 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
                 // The root's middlewares cover every path, even outside a root `path`.
                 nodes[0] = .{ .mount = root.middlewares };
                 var count: u16 = 1;
-                insert(&nodes, &count, 0, root, &.{});
+                insert(&nodes, &count, 0, root, &.{}, .{});
                 checkShadowing(nodes[0..count], 0);
 
                 var out: [count]CNode = undefined;
@@ -354,9 +423,11 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
             comptime parent: u16,
             comptime router: Self,
             comptime inherited: []const MiddlewareFn,
+            comptime inherited_config: RouteConfig,
         ) void {
             const at = descend(nodes, count, parent, router.path);
             const mws: []const MiddlewareFn = inherited ++ router.middlewares;
+            const cfg = inherited_config.merge(router.config);
             mount(&nodes[at], mws);
 
             for (router.handlers) |h| {
@@ -367,7 +438,12 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
                     if (e.handler.method == h.method)
                         @compileError("duplicate route: " ++ @tagName(h.method.?) ++ " " ++ n.path);
                 }
-                n.entries[n.entries_len] = .{ .handler = h, .middlewares = mws ++ h.middlewares, .allow = &.{} };
+                n.entries[n.entries_len] = .{
+                    .handler = h,
+                    .middlewares = mws ++ h.middlewares,
+                    .allow = &.{},
+                    .config = .resolve(cfg.merge(h.config), n.path),
+                };
                 n.entries_len += 1;
             }
 
@@ -378,7 +454,7 @@ pub fn GenericRouter(comptime AppContext: type, comptime RequestContext: type) t
                         @compileError("routers with the same path under " ++ nodes[at].path ++ ": \"" ++
                             prev.path ++ "\" and \"" ++ r.path ++ "\"; merge them into one");
                 }
-                insert(nodes, count, at, r, mws);
+                insert(nodes, count, at, r, mws, cfg);
             }
         }
 
@@ -778,4 +854,71 @@ test "router: lists every route in declaration order" {
     try testing.expectEqual(@as(usize, 2), Catch.list.len);
     try testing.expectEqualStrings("*", Catch.list[1].path);
     try testing.expectEqual(@as(?std.http.Method, .POST), Catch.list[1].method);
+}
+
+test "router: config is inherited and the closest one wins" {
+    const Cfg = TestRouter.Compiled(.{
+        .handlers = &.{.get("/plain", cb(1))},
+        .routes = &.{.{
+            .path = "/api",
+            .config = .{ .status = .accepted },
+            .handlers = &.{
+                .get("/inherit", cb(2)),
+                .{ .path = "/own", .method = .POST, .callback = cb(3), .config = .{ .status = .created } },
+            },
+            .routes = &.{
+                .{ .path = "/deeper", .handlers = &.{.get("", cb(4))} },
+                .{ .path = "/reset", .config = .{ .status = .ok }, .handlers = &.{.get("", cb(5))} },
+            },
+        }},
+    });
+    var params: Params = .{};
+    const cases = [_]struct { std.http.Method, []const u8, std.http.Status }{
+        .{ .GET, "/plain", .ok },
+        .{ .GET, "/api/inherit", .accepted },
+        .{ .POST, "/api/own", .created },
+        .{ .GET, "/api/deeper", .accepted },
+        .{ .GET, "/api/reset", .ok },
+    };
+    for (cases) |c| try testing.expectEqual(c[2], (try Cfg.match(c[0], c[1], &params)).config.status);
+}
+
+test "router: RouteConfig.merge replaces only the fields that are set" {
+    const base: RouteConfig = .{ .status = .created };
+    try testing.expectEqual(@as(?std.http.Status, .created), base.merge(.{}).status);
+    try testing.expectEqual(@as(?std.http.Status, .no_content), base.merge(.{ .status = .no_content }).status);
+}
+
+test "router: produces is inherited, and an empty list turns it off" {
+    const Cfg = TestRouter.Compiled(.{
+        .config = .{ .produces = &.{ "application/json", "text/html" } },
+        .handlers = &.{
+            .get("/a", cb(1)),
+            .{ .path = "/b", .callback = cb(2), .config = .{ .produces = &.{} } },
+            .{ .path = "/c", .callback = cb(3), .config = .{ .status = .created } },
+        },
+    });
+    var params: Params = .{};
+    try testing.expectEqual(@as(usize, 2), (try Cfg.match(.GET, "/a", &params)).config.produces.len);
+    try testing.expectEqual(@as(usize, 0), (try Cfg.match(.GET, "/b", &params)).config.produces.len);
+    const c = try Cfg.match(.GET, "/c", &params);
+    try testing.expectEqualStrings("text/html", c.config.produces[1]);
+    try testing.expectEqual(std.http.Status.created, c.config.status);
+}
+
+test "router: consumes is inherited, allows wildcards, and an empty list turns it off" {
+    const Cfg = TestRouter.Compiled(.{
+        .config = .{ .consumes = &.{ "application/json", "image/*" } },
+        .handlers = &.{
+            .post("/a", cb(1)),
+            .{ .path = "/b", .method = .POST, .callback = cb(2), .config = .{ .consumes = &.{} } },
+            .{ .path = "/c", .method = .POST, .callback = cb(3), .config = .{ .consumes = &.{"*/*"} } },
+        },
+    });
+    var params: Params = .{};
+    const a = try Cfg.match(.POST, "/a", &params);
+    try testing.expectEqual(@as(usize, 2), a.config.consumes.len);
+    try testing.expectEqualStrings("application/json, image/*", a.config.consumes_header);
+    try testing.expectEqual(@as(usize, 0), (try Cfg.match(.POST, "/b", &params)).config.consumes.len);
+    try testing.expectEqualStrings("*/*", (try Cfg.match(.POST, "/c", &params)).config.consumes_header);
 }

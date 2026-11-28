@@ -3,6 +3,9 @@ const GenericRequest = @import("http/request.zig").GenericRequest;
 const Response = @import("http/response.zig").Response;
 const Middleware = @import("constants.zig").Middleware;
 const Callback = @import("constants.zig").Callback;
+const negotiation = @import("http/negotiation.zig");
+const HttpError = @import("http/http_error.zig").HttpError;
+const ResolvedRouteConfig = @import("router.zig").ResolvedRouteConfig;
 
 pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) type {
     const Request = GenericRequest(RequestContext);
@@ -20,9 +23,13 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
         app_context: *AppContext,
         middleware_list: []const Middleware(AppContext, RequestContext),
         callback: CallbackFn,
+        /// The matched route's config; `consumes` and `produces` are checked once the middlewares have run.
+        config: *const ResolvedRouteConfig = &ResolvedRouteConfig.default,
 
         pub fn next(self: Self) !void {
             if (self.index == self.middleware_list.len) {
+                if (self.config.consumes.len > 0) try self.checkContentType();
+                if (self.config.produces.len > 0) try self.negotiate();
                 if (AppContext == void) {
                     try self.callback(self.io, self.request, self.response);
                 } else {
@@ -39,6 +46,7 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
                     .middleware_list = self.middleware_list,
                     .callback = self.callback,
                     .allow = self.allow,
+                    .config = self.config,
                 };
                 if (AppContext == void) {
                     try middleware(self.io, self.request, self.response, action);
@@ -46,6 +54,37 @@ pub fn GenericAction(comptime AppContext: type, comptime RequestContext: type) t
                     try middleware(self.app_context, self.io, self.request, self.response, action);
                 }
             }
+        }
+
+        fn negotiate(self: Self) !void {
+            const produces = self.config.produces;
+            // Caches must not reuse a response for requests with another Accept.
+            if (produces.len > 1) try self.response.addHeader("Vary", "Accept");
+            const i = negotiation.select(produces, self.request.getHeaders("Accept")) orelse
+                return HttpError.NotAcceptable;
+            self.response.content_type = produces[i];
+        }
+
+        fn checkContentType(self: Self) !void {
+            const body = self.request.body orelse return;
+            if (body.len == 0) return;
+            var values = self.request.getHeaders("Content-Type");
+            // RFC 9110 §8.3: a body without a type may be treated as application/octet-stream.
+            const value = values.next() orelse "application/octet-stream";
+            while (values.next()) |other| {
+                if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, other, " \t"), std.mem.trim(u8, value, " \t")))
+                    return HttpError.BadRequest;
+            }
+            self.request.content_type = negotiation.matchContentType(self.config.consumes, value) catch |err| switch (err) {
+                error.Malformed => return HttpError.BadRequest,
+                error.Unsupported => {
+                    // Tell the client what it may send instead.
+                    const method = self.request.method;
+                    if (std.mem.eql(u8, method, "POST")) try self.response.addHeader("Accept-Post", self.config.consumes_header);
+                    if (std.mem.eql(u8, method, "PATCH")) try self.response.addHeader("Accept-Patch", self.config.consumes_header);
+                    return HttpError.UnsupportedMediaType;
+                },
+            };
         }
     };
 }

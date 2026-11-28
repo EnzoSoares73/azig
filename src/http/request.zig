@@ -20,6 +20,8 @@ pub fn GenericRequest(comptime RequestContext: type) type {
         path_params: Params,
         body: ?[]const u8,
         context: RequestContext,
+        /// The body's media type without parameters, set when the route has `consumes`.
+        content_type: ?[]const u8 = null,
 
         const Self = @This();
 
@@ -40,6 +42,7 @@ pub fn GenericRequest(comptime RequestContext: type) type {
             self.headers.reset();
             self.query_params.reset();
             self.body = null;
+            self.content_type = null;
             self.path_params = .{};
             self.method = undefined;
             self.path = undefined;

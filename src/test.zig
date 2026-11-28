@@ -8,6 +8,7 @@ test {
     _ = @import("pools/reuse_pool.zig");
     _ = @import("http/fields.zig");
     _ = @import("http/header.zig");
+    _ = @import("http/negotiation.zig");
     _ = @import("http/http_error.zig");
     _ = @import("pools/sync.zig");
     _ = @import("libuv_io.zig");

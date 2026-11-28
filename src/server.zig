@@ -613,6 +613,8 @@ pub fn Server(comptime AppContext: type, comptime RequestContext: type) type {
                 action.middleware_list = entry.middlewares;
                 action.callback = entry.handler.callback;
                 action.allow = entry.allow;
+                response.*.status_code = @intFromEnum(entry.config.status);
+                action.config = &entry.config;
             } else |err| {
                 // The middlewares still run
                 const miss = routes.miss(request.*.path);
@@ -2159,11 +2161,27 @@ fn routedUser(_: std.Io, request: *GenericRequest(void), response: *Response) !v
     response.body = try std.fmt.allocPrint(response.arena.allocator(), "user {s}", .{request.path_params.get("id").?});
 }
 
-const routed_router: GenericRouter(void, void) = .{ .handlers = &.{
-    .get("/users", routedUsers),
-    .post("/users", routedCreate),
-    .get("/users/:id", routedUser),
-} };
+fn routedAccepted(_: std.Io, _: *GenericRequest(void), response: *Response) !void {
+    response.body = "queued";
+}
+
+fn routedOverride(_: std.Io, _: *GenericRequest(void), response: *Response) !void {
+    response.status_code = 200;
+    response.body = "done now";
+}
+
+const routed_router: GenericRouter(void, void) = .{
+    .handlers = &.{
+        .get("/users", routedUsers),
+        .post("/users", routedCreate),
+        .get("/users/:id", routedUser),
+    },
+    .routes = &.{.{
+        .path = "/jobs",
+        .config = .{ .status = .accepted },
+        .handlers = &.{ .post("", routedAccepted), .put("", routedOverride) },
+    }},
+};
 
 /// Sends one request on its own connection and returns everything the server answered.
 fn routedRequest(allocator: mem.Allocator, port: u16, comptime request_line: []const u8) ![]u8 {
@@ -2222,6 +2240,25 @@ test "routes are chosen by path and method" {
         const received = try routedRequest(allocator, port, "GET /nope");
         defer allocator.free(received);
         try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 404 Not Found\r\n"));
+    }
+    {
+        // The router's default status applies...
+        const received = try routedRequest(allocator, port, "POST /jobs");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 202 Accepted\r\n"));
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\nqueued"));
+    }
+    {
+        // ...but the handler can still change it.
+        const received = try routedRequest(allocator, port, "PUT /jobs");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\ndone now"));
+    }
+    {
+        const received = try routedRequest(allocator, port, "DELETE /jobs");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 405 Method Not Allowed\r\n"));
     }
 }
 
@@ -2303,7 +2340,7 @@ test "routes are formatted as one message, without a trailing newline" {
         .{ .method = null, .path = "/any" },
     });
     try testing.expectEqualStrings(
-        "\n\tRoutes:\n\t\tGET     /users\n\t\tPOST    /users\n\t\tGET     /users/:id\n\t\tANY     /any",
+        "\n\tRoutes:\n\t\tGET     /users\n\t\tPOST    /users\n\t\tGET     /users/:id\n\t\tPOST    /jobs\n\t\tPUT     /jobs\n\t\tANY     /any",
         buf.items,
     );
 }
@@ -2452,4 +2489,175 @@ test "a reused request and response carry nothing over to the next request" {
 
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nX-First: yes\r\nContent-Length: 6\r\n\r\n/first" ++
         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n/second", received);
+}
+
+fn negotiatedDoc(_: std.Io, _: *GenericRequest(void), response: *Response) !void {
+    response.body = if (mem.eql(u8, response.content_type.?, "text/html")) "<p>doc</p>" else "{\"doc\":1}";
+}
+
+fn negotiatedOwnHeader(_: std.Io, _: *GenericRequest(void), response: *Response) !void {
+    try response.addHeader("Content-Type", "application/json; charset=utf-8");
+    response.body = "{}";
+}
+
+const negotiated_router: GenericRouter(void, void) = .{
+    .config = .{ .produces = &.{ "application/json", "text/html" } },
+    .handlers = &.{
+        .get("/doc", negotiatedDoc),
+        .{ .path = "/own", .callback = negotiatedOwnHeader, .config = .{ .produces = &.{"application/json"} } },
+    },
+    .routes = &.{.{
+        .path = "/api",
+        .middlewares = &.{requireUser},
+        .handlers = &.{.get("/doc", negotiatedDoc)},
+    }},
+};
+
+test "produces negotiates the response type from Accept" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, negotiated_router, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    {
+        // No Accept: the first type.
+        const received = try guardedRequest(allocator, port, "GET /doc", "");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(mem.indexOf(u8, received, "Content-Type: application/json\r\n") != null);
+        try testing.expect(mem.indexOf(u8, received, "Vary: Accept\r\n") != null);
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\n{\"doc\":1}"));
+    }
+    {
+        const received = try guardedRequest(allocator, port, "GET /doc", "Accept: application/json;q=0.5, text/*\r\n");
+        defer allocator.free(received);
+        try testing.expect(mem.indexOf(u8, received, "Content-Type: text/html\r\n") != null);
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\n<p>doc</p>"));
+    }
+    {
+        // HEAD keeps the type, drops the body.
+        const received = try guardedRequest(allocator, port, "HEAD /doc", "Accept: text/html\r\n");
+        defer allocator.free(received);
+        try testing.expect(mem.indexOf(u8, received, "Content-Type: text/html\r\n") != null);
+        try testing.expect(mem.endsWith(u8, received, "\r\n\r\n"));
+    }
+    {
+        const received = try guardedRequest(allocator, port, "GET /doc", "Accept: image/png\r\n");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 406 Not Acceptable\r\n"));
+        try testing.expect(mem.indexOf(u8, received, "Vary: Accept\r\n") != null);
+        try testing.expect(mem.indexOf(u8, received, "Content-Type:") == null);
+    }
+    {
+        // The handler's own Content-Type wins; a single type needs no Vary.
+        const received = try guardedRequest(allocator, port, "GET /own", "Accept: application/*\r\n");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 200 OK\r\n"));
+        try testing.expectEqual(@as(usize, 1), mem.count(u8, received, "Content-Type:"));
+        try testing.expect(mem.indexOf(u8, received, "Content-Type: application/json; charset=utf-8\r\n") != null);
+        try testing.expect(mem.indexOf(u8, received, "Vary:") == null);
+    }
+    {
+        const received = try guardedRequest(allocator, port, "GET /own", "Accept: text/html\r\n");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 406 Not Acceptable\r\n"));
+    }
+    {
+        // Middlewares run first: an unauthenticated client gets the 401, not the 406.
+        const received = try guardedRequest(allocator, port, "GET /api/doc", "Accept: image/png\r\n");
+        defer allocator.free(received);
+        try testing.expect(mem.startsWith(u8, received, "HTTP/1.1 401 Unauthorized\r\n"));
+    }
+}
+
+fn consumedEcho(_: std.Io, request: *GenericRequest(void), response: *Response) !void {
+    response.body = request.content_type orelse "none";
+}
+
+const consumes_router: GenericRouter(void, void) = .{
+    .config = .{ .consumes = &.{ "application/json", "image/*" }, .produces = &.{"text/plain"} },
+    .handlers = &.{
+        .get("/items", consumedEcho),
+        .post("/items", consumedEcho),
+        .put("/items", consumedEcho),
+        .patch("/items", consumedEcho),
+    },
+    .routes = &.{
+        .{ .path = "/api", .middlewares = &.{requireUser}, .handlers = &.{.post("/items", consumedEcho)} },
+        .{ .path = "/raw", .config = .{ .consumes = &.{} }, .handlers = &.{.post("", consumedEcho)} },
+    },
+};
+
+/// Sends one request with `body` (and its Content-Length) and returns everything the server answered.
+fn bodyRequest(allocator: mem.Allocator, port: u16, comptime request_line: []const u8, comptime headers: []const u8, comptime body: []const u8) ![]u8 {
+    const stream = try raw_client.connect(port);
+    defer stream.close(raw_client.io);
+    try raw_client.send(stream, request_line ++ " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n" ++ headers ++
+        std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n", .{body.len}) ++ body);
+    return raw_client.receiveAll(stream, allocator);
+}
+
+test "consumes checks the Content-Type of request bodies" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }).init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var server = try Server(void, void).init(allocator, .{ .port = 0 }, consumes_router, {});
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServer, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    const port = try waitUntilListening(&server);
+
+    const Case = struct {
+        line: []const u8,
+        headers: []const u8,
+        body: []const u8,
+        status: []const u8,
+        /// Expected response body, or a header the response must contain.
+        expect: []const u8 = "",
+        absent: []const u8 = "",
+    };
+    const cases = comptime [_]Case{
+        // Accepted: the handler sees the media type without parameters.
+        .{ .line = "POST /items", .headers = "Content-Type: application/json; charset=utf-8\r\n", .body = "{}", .status = "200 OK", .expect = "\r\n\r\napplication/json" },
+        .{ .line = "POST /items", .headers = "Content-Type: image/png\r\n", .body = "png", .status = "200 OK", .expect = "\r\n\r\nimage/png" },
+        // No body, nothing to check.
+        .{ .line = "GET /items", .headers = "", .body = "", .status = "200 OK", .expect = "\r\n\r\nnone" },
+        .{ .line = "POST /items", .headers = "", .body = "", .status = "200 OK", .expect = "\r\n\r\nnone" },
+        // Unsupported: 415, advertising what POST and PATCH accept.
+        .{ .line = "POST /items", .headers = "Content-Type: text/plain\r\n", .body = "hi", .status = "415 Unsupported Media Type", .expect = "Accept-Post: application/json, image/*\r\n" },
+        .{ .line = "PATCH /items", .headers = "Content-Type: text/plain\r\n", .body = "hi", .status = "415 Unsupported Media Type", .expect = "Accept-Patch: application/json, image/*\r\n" },
+        .{ .line = "PUT /items", .headers = "Content-Type: text/plain\r\n", .body = "hi", .status = "415 Unsupported Media Type", .absent = "Accept-P" },
+        // A body without Content-Type is application/octet-stream.
+        .{ .line = "POST /items", .headers = "", .body = "hi", .status = "415 Unsupported Media Type" },
+        // Broken requests.
+        .{ .line = "POST /items", .headers = "Content-Type: json\r\n", .body = "{}", .status = "400 Bad Request" },
+        .{ .line = "POST /items", .headers = "Content-Type: application/json\r\nContent-Type: text/plain\r\n", .body = "{}", .status = "400 Bad Request" },
+        // Middlewares run first, and 415 comes before 406.
+        .{ .line = "POST /api/items", .headers = "Content-Type: text/plain\r\n", .body = "hi", .status = "401 Unauthorized" },
+        .{ .line = "POST /items", .headers = "Content-Type: text/csv\r\nAccept: image/png\r\n", .body = "a,b", .status = "415 Unsupported Media Type" },
+        // `&.{}` turns the check off.
+        .{ .line = "POST /raw", .headers = "Content-Type: text/csv\r\n", .body = "a,b", .status = "200 OK", .expect = "\r\n\r\nnone" },
+    };
+    inline for (cases) |c| {
+        const received = try bodyRequest(allocator, port, c.line, c.headers, c.body);
+        defer allocator.free(received);
+        testing.expect(mem.startsWith(u8, received, "HTTP/1.1 " ++ c.status ++ "\r\n")) catch |err| {
+            std.debug.print("{s}: expected {s}, got:\n{s}\n", .{ c.line, c.status, received });
+            return err;
+        };
+        if (c.expect.len > 0) try testing.expect(mem.indexOf(u8, received, c.expect) != null);
+        if (c.absent.len > 0) try testing.expect(mem.indexOf(u8, received, c.absent) == null);
+    }
 }

@@ -14,6 +14,7 @@ pub const Response = struct {
     arena: std.heap.ArenaAllocator,
     /// When false, the body is left out but Content-Length still reflects it (HEAD responses).
     send_body: bool,
+    content_type: ?[]const u8 = null,
 
     const Self = @This();
 
@@ -38,6 +39,7 @@ pub const Response = struct {
         self.body = null;
         self.status_code = 200;
         self.send_body = true;
+        self.content_type = null;
     }
 
     pub fn deinit(self: *Self) void {
@@ -111,6 +113,11 @@ pub const Response = struct {
             size += "\r\n".len;
         }
 
+        if (self.implicitContentType()) |ct| {
+            if (!http_header.isValidValue(ct)) return Error.InvalidHeader;
+            size += "Content-Type: ".len + ct.len + "\r\n".len;
+        }
+
         const content_length = "Content-Length";
         const len = if (self.body) |b| b.len else 0;
         size += content_length.len;
@@ -139,6 +146,8 @@ pub const Response = struct {
             try writer.print("{s}: {s}\r\n", .{ field.name, field.value });
         }
 
+        if (self.implicitContentType()) |ct| try writer.print("Content-Type: {s}\r\n", .{ct});
+
         const len = if (self.body) |b| b.len else 0;
         try writer.print("Content-Length: {d}\r\n", .{len});
 
@@ -149,6 +158,16 @@ pub const Response = struct {
                 try writer.writeAll(b);
             }
         }
+    }
+
+    /// Should be sent when there is a body and no explicit header.
+    fn implicitContentType(self: *const Self) ?[]const u8 {
+        const ct = self.content_type orelse return null;
+        if (self.body == null) return null;
+        for (self.headers.items()) |field| {
+            if (std.ascii.eqlIgnoreCase(field.name, "Content-Type")) return null;
+        }
+        return ct;
     }
 
     pub fn setResponseError(self: *Self, code: u16) void {
@@ -395,4 +414,30 @@ test "Response reset clears everything set by the previous request" {
     try testing.expectEqual(@as(?[]const u8, null), response.body);
     try testing.expectEqual(@as(u16, 200), response.status_code);
     try testing.expect(response.send_body);
+}
+
+test "Response content_type is sent only with a body and without an explicit header" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var response = Response.init(allocator);
+    response.content_type = "application/json";
+
+    var out = try response.toString(allocator);
+    try testing.expect(mem.indexOf(u8, out, "Content-Type") == null);
+
+    response.body = "{}";
+    out = try response.toString(allocator);
+    try testing.expect(mem.indexOf(u8, out, "Content-Type: application/json\r\n") != null);
+    try testing.expect(mem.endsWith(u8, out, "\r\n\r\n{}"));
+
+    try response.addHeader("content-type", "text/plain");
+    out = try response.toString(allocator);
+    // Header names are case-insensitive: the explicit one replaces content_type.
+    try testing.expect(mem.indexOf(u8, out, "content-type: text/plain\r\n") != null);
+    try testing.expect(mem.indexOf(u8, out, "application/json") == null);
+
+    response.reset();
+    try testing.expectEqual(@as(?[]const u8, null), response.content_type);
 }
